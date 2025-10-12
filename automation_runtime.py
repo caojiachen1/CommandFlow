@@ -19,6 +19,11 @@ class PyAutoGuiRuntime:
         self._pyautogui = pyautogui_module or self._import_pyautogui()
         self._pyautogui.FAILSAFE = True
         self._pyautogui.PAUSE = 0.05
+        self._failsafe_exception_type: type[BaseException] = getattr(
+            self._pyautogui,
+            "FailSafeException",
+            RuntimeError,
+        )
 
     @staticmethod
     def _import_pyautogui() -> Any:
@@ -42,13 +47,21 @@ class PyAutoGuiRuntime:
         clicks: int,
         interval: float,
     ) -> None:
-        self._pyautogui.click(
-            x=x,
-            y=y,
-            button=button,
-            clicks=clicks,
-            interval=interval,
-        )
+        try:
+            self._pyautogui.click(
+                x=x,
+                y=y,
+                button=button,
+                clicks=clicks,
+                interval=interval,
+            )
+        except self._failsafe_exception_type as exc:
+            raise RuntimeError(
+                f"PyAutoGUI fail-safe triggered while clicking at ({x}, {y}). "
+                "The pointer reached a screen corner. Adjust the coordinates to avoid "
+                "screen corners, or disable pyautogui.FAILSAFE only if you understand the risks."
+            ) from exc
+        
 
     def type_text(self, text: str, interval: float) -> None:
         self._pyautogui.write(text, interval=interval)

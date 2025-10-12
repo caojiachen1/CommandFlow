@@ -162,8 +162,9 @@ class MouseClickNode(WorkflowNodeModel):
 
     def default_config(self) -> Dict[str, Any]:
         return {
-            "x": 0,
-            "y": 0,
+            # Default away from fail-safe corners to avoid accidental aborts.
+            "x": 100,
+            "y": 100,
             "button": "left",
             "clicks": 1,
             "interval": 0.1,
