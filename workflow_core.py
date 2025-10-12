@@ -31,7 +31,40 @@ class AutomationRuntime(Protocol):
         interval: float,
     ) -> None: ...
 
+    def move_mouse(self, x: int, y: int, duration: float) -> None: ...
+
+    def drag_mouse(
+        self,
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        button: str,
+        move_duration: float,
+        drag_duration: float,
+    ) -> None: ...
+
+    def mouse_scroll(
+        self,
+        clicks: int,
+        orientation: str,
+        x: int | None,
+        y: int | None,
+    ) -> None: ...
+
+    def mouse_down(self, x: int, y: int, button: str) -> None: ...
+
+    def mouse_up(self, x: int, y: int, button: str) -> None: ...
+
     def type_text(self, text: str, interval: float) -> None: ...
+
+    def press_key(self, key: str, presses: int, interval: float) -> None: ...
+
+    def key_down(self, key: str) -> None: ...
+
+    def key_up(self, key: str) -> None: ...
+
+    def press_hotkey(self, keys: list[str], interval: float) -> None: ...
 
 
 @dataclass
@@ -260,10 +293,388 @@ class KeyboardInputNode(WorkflowNodeModel):
         return None
 
 
+class MouseMoveNode(WorkflowNodeModel):
+    type_name = "mouse_move"
+    display_name = "鼠标移动"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"x": 100, "y": 100, "duration": 0.2}
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        for axis in ("x", "y"):
+            if not isinstance(cfg.get(axis), int):
+                raise ValueError(f"{axis} must be an integer")
+        duration = cfg.get("duration")
+        if not isinstance(duration, (int, float)) or duration < 0:
+            raise ValueError("duration must be non-negative")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "x", "label": "X", "type": "int", "min": 0, "max": 10000},
+            {"key": "y", "label": "Y", "type": "int", "min": 0, "max": 10000},
+            {
+                "key": "duration",
+                "label": "移动时长",
+                "type": "float",
+                "min": 0.0,
+                "max": 5.0,
+                "step": 0.05,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        runtime.move_mouse(cfg["x"], cfg["y"], float(cfg["duration"]))
+        context.record(self.id, "ok")
+        return None
+
+
+class MouseDragNode(WorkflowNodeModel):
+    type_name = "mouse_drag"
+    display_name = "鼠标拖拽"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "start_x": 100,
+            "start_y": 100,
+            "end_x": 300,
+            "end_y": 300,
+            "button": "left",
+            "move_duration": 0.2,
+            "drag_duration": 0.5,
+        }
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        for axis in ("start_x", "start_y", "end_x", "end_y"):
+            if not isinstance(cfg.get(axis), int):
+                raise ValueError(f"{axis} must be an integer")
+        if cfg.get("button") not in {"left", "right", "middle"}:
+            raise ValueError("button must be left/right/middle")
+        for key in ("move_duration", "drag_duration"):
+            value = cfg.get(key)
+            if not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{key} must be non-negative")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "start_x", "label": "起点X", "type": "int", "min": 0, "max": 10000},
+            {"key": "start_y", "label": "起点Y", "type": "int", "min": 0, "max": 10000},
+            {"key": "end_x", "label": "终点X", "type": "int", "min": 0, "max": 10000},
+            {"key": "end_y", "label": "终点Y", "type": "int", "min": 0, "max": 10000},
+            {
+                "key": "button",
+                "label": "按键",
+                "type": "choices",
+                "choices": [("left", "左键"), ("right", "右键"), ("middle", "中键")],
+            },
+            {
+                "key": "move_duration",
+                "label": "移动时长",
+                "type": "float",
+                "min": 0.0,
+                "max": 5.0,
+                "step": 0.05,
+            },
+            {
+                "key": "drag_duration",
+                "label": "拖拽时长",
+                "type": "float",
+                "min": 0.0,
+                "max": 5.0,
+                "step": 0.05,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        runtime.drag_mouse(
+            cfg["start_x"],
+            cfg["start_y"],
+            cfg["end_x"],
+            cfg["end_y"],
+            cfg["button"],
+            float(cfg["move_duration"]),
+            float(cfg["drag_duration"]),
+        )
+        context.record(self.id, "ok")
+        return None
+
+
+class MouseScrollNode(WorkflowNodeModel):
+    type_name = "mouse_scroll"
+    display_name = "鼠标滚轮"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "clicks": -300,
+            "orientation": "vertical",
+            "x": "",
+            "y": "",
+        }
+
+    def _parse_optional_coordinate(self, value: Any) -> int | None:
+        if value in ("", None):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError as exc:  # pragma: no cover - validation handles message
+                raise ValueError("坐标必须为整数或留空") from exc
+        raise ValueError("坐标必须为整数或留空")
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        clicks = cfg.get("clicks")
+        if not isinstance(clicks, int) or clicks == 0:
+            raise ValueError("clicks must be a non-zero integer")
+        if cfg.get("orientation") not in {"vertical", "horizontal"}:
+            raise ValueError("orientation must be vertical/horizontal")
+        self.config["x"] = self._parse_optional_coordinate(cfg.get("x"))
+        self.config["y"] = self._parse_optional_coordinate(cfg.get("y"))
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "clicks",
+                "label": "滚动量",
+                "type": "int",
+                "min": -10000,
+                "max": 10000,
+            },
+            {
+                "key": "orientation",
+                "label": "方向",
+                "type": "choices",
+                "choices": [("vertical", "垂直"), ("horizontal", "水平")],
+            },
+            {"key": "x", "label": "目标X(可空)", "type": "str"},
+            {"key": "y", "label": "目标Y(可空)", "type": "str"},
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        x_val = cfg.get("x")
+        y_val = cfg.get("y")
+        runtime.mouse_scroll(
+            cfg["clicks"],
+            cfg["orientation"],
+            x_val if isinstance(x_val, int) else None,
+            y_val if isinstance(y_val, int) else None,
+        )
+        context.record(self.id, "ok")
+        return None
+
+
+class MouseDownNode(WorkflowNodeModel):
+    type_name = "mouse_down"
+    display_name = "鼠标按下"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"x": 100, "y": 100, "button": "left"}
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        for axis in ("x", "y"):
+            if not isinstance(cfg.get(axis), int):
+                raise ValueError(f"{axis} must be an integer")
+        if cfg.get("button") not in {"left", "right", "middle"}:
+            raise ValueError("button must be left/right/middle")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "x", "label": "X", "type": "int", "min": 0, "max": 10000},
+            {"key": "y", "label": "Y", "type": "int", "min": 0, "max": 10000},
+            {
+                "key": "button",
+                "label": "按键",
+                "type": "choices",
+                "choices": [("left", "左键"), ("right", "右键"), ("middle", "中键")],
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        runtime.mouse_down(cfg["x"], cfg["y"], cfg["button"])
+        context.record(self.id, "ok")
+        return None
+
+
+class MouseUpNode(WorkflowNodeModel):
+    type_name = "mouse_up"
+    display_name = "鼠标抬起"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"x": 100, "y": 100, "button": "left"}
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        for axis in ("x", "y"):
+            if not isinstance(cfg.get(axis), int):
+                raise ValueError(f"{axis} must be an integer")
+        if cfg.get("button") not in {"left", "right", "middle"}:
+            raise ValueError("button must be left/right/middle")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "x", "label": "X", "type": "int", "min": 0, "max": 10000},
+            {"key": "y", "label": "Y", "type": "int", "min": 0, "max": 10000},
+            {
+                "key": "button",
+                "label": "按键",
+                "type": "choices",
+                "choices": [("left", "左键"), ("right", "右键"), ("middle", "中键")],
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        runtime.mouse_up(cfg["x"], cfg["y"], cfg["button"])
+        context.record(self.id, "ok")
+        return None
+
+
+class KeyPressNode(WorkflowNodeModel):
+    type_name = "key_press"
+    display_name = "按键触发"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"key": "enter", "presses": 1, "interval": 0.05}
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        if not isinstance(cfg.get("key"), str) or not cfg["key"].strip():
+            raise ValueError("key must be a non-empty string")
+        presses = cfg.get("presses")
+        if not isinstance(presses, int) or presses <= 0:
+            raise ValueError("presses must be a positive integer")
+        interval = cfg.get("interval")
+        if not isinstance(interval, (int, float)) or interval < 0:
+            raise ValueError("interval must be non-negative")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "key", "label": "按键", "type": "str"},
+            {
+                "key": "presses",
+                "label": "次数",
+                "type": "int",
+                "min": 1,
+                "max": 50,
+            },
+            {
+                "key": "interval",
+                "label": "间隔",
+                "type": "float",
+                "min": 0.0,
+                "max": 5.0,
+                "step": 0.05,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        runtime.press_key(cfg["key"].strip(), cfg["presses"], float(cfg["interval"]))
+        context.record(self.id, "ok")
+        return None
+
+
+class HotkeyNode(WorkflowNodeModel):
+    type_name = "hotkey"
+    display_name = "组合按键"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"keys": "ctrl+shift+esc", "interval": 0.05}
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        if not isinstance(cfg.get("keys"), str) or not cfg["keys"].strip():
+            raise ValueError("keys must be a non-empty string")
+        interval = cfg.get("interval")
+        if not isinstance(interval, (int, float)) or interval < 0:
+            raise ValueError("interval must be non-negative")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "keys", "label": "按键序列", "type": "str"},
+            {
+                "key": "interval",
+                "label": "按键间隔",
+                "type": "float",
+                "min": 0.0,
+                "max": 5.0,
+                "step": 0.05,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        keys = [part.strip() for part in cfg["keys"].split("+") if part.strip()]
+        if not keys:
+            raise ExecutionError("组合按键列表不能为空")
+        runtime.press_hotkey(keys, float(cfg["interval"]))
+        context.record(self.id, "ok")
+        return None
+
+
+class KeyDownNode(WorkflowNodeModel):
+    type_name = "key_down"
+    display_name = "按键按下"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"key": "shift"}
+
+    def validate_config(self) -> None:
+        key = self.config.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("key must be a non-empty string")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [{"key": "key", "label": "按键", "type": "str"}]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        runtime.key_down(self.config["key"].strip())
+        context.record(self.id, "ok")
+        return None
+
+
+class KeyUpNode(WorkflowNodeModel):
+    type_name = "key_up"
+    display_name = "按键抬起"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"key": "shift"}
+
+    def validate_config(self) -> None:
+        key = self.config.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("key must be a non-empty string")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [{"key": "key", "label": "按键", "type": "str"}]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        runtime.key_up(self.config["key"].strip())
+        context.record(self.id, "ok")
+        return None
+
+
 NODE_REGISTRY = {
     ScreenshotNode.type_name: ScreenshotNode,
     MouseClickNode.type_name: MouseClickNode,
+    MouseMoveNode.type_name: MouseMoveNode,
+    MouseDragNode.type_name: MouseDragNode,
+    MouseScrollNode.type_name: MouseScrollNode,
+    MouseDownNode.type_name: MouseDownNode,
+    MouseUpNode.type_name: MouseUpNode,
     KeyboardInputNode.type_name: KeyboardInputNode,
+    KeyPressNode.type_name: KeyPressNode,
+    HotkeyNode.type_name: HotkeyNode,
+    KeyDownNode.type_name: KeyDownNode,
+    KeyUpNode.type_name: KeyUpNode,
 }
 
 

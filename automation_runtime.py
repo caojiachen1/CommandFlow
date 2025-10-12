@@ -61,7 +61,79 @@ class PyAutoGuiRuntime:
                 "The pointer reached a screen corner. Adjust the coordinates to avoid "
                 "screen corners, or disable pyautogui.FAILSAFE only if you understand the risks."
             ) from exc
-        
+
+    def move_mouse(self, x: int, y: int, duration: float) -> None:
+        try:
+            self._pyautogui.moveTo(x, y, duration=duration)
+        except self._failsafe_exception_type as exc:
+            raise RuntimeError(
+                f"PyAutoGUI fail-safe triggered while moving to ({x}, {y})."
+            ) from exc
+
+    def drag_mouse(
+        self,
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        button: str,
+        move_duration: float,
+        drag_duration: float,
+    ) -> None:
+        try:
+            self._pyautogui.moveTo(start_x, start_y, duration=move_duration)
+            self._pyautogui.dragTo(
+                end_x,
+                end_y,
+                duration=drag_duration,
+                button=button,
+            )
+        except self._failsafe_exception_type as exc:
+            raise RuntimeError(
+                "PyAutoGUI fail-safe triggered while dragging the pointer."
+            ) from exc
+
+    def mouse_scroll(
+        self,
+        clicks: int,
+        orientation: str,
+        x: int | None,
+        y: int | None,
+    ) -> None:
+        if orientation == "horizontal":
+            self._pyautogui.hscroll(clicks, x=x, y=y)
+        else:
+            self._pyautogui.scroll(clicks, x=x, y=y)
+
+    def mouse_down(self, x: int, y: int, button: str) -> None:
+        try:
+            self._pyautogui.mouseDown(x=x, y=y, button=button)
+        except self._failsafe_exception_type as exc:
+            raise RuntimeError(
+                f"PyAutoGUI fail-safe triggered while pressing the {button} button at ({x}, {y})."
+            ) from exc
+
+    def mouse_up(self, x: int, y: int, button: str) -> None:
+        try:
+            self._pyautogui.mouseUp(x=x, y=y, button=button)
+        except self._failsafe_exception_type as exc:
+            raise RuntimeError(
+                f"PyAutoGUI fail-safe triggered while releasing the {button} button at ({x}, {y})."
+            ) from exc
 
     def type_text(self, text: str, interval: float) -> None:
         self._pyautogui.write(text, interval=interval)
+
+    def press_key(self, key: str, presses: int, interval: float) -> None:
+        self._pyautogui.press(key, presses=presses, interval=interval)
+
+    def key_down(self, key: str) -> None:
+        self._pyautogui.keyDown(key)
+
+    def key_up(self, key: str) -> None:
+        self._pyautogui.keyUp(key)
+
+    def press_hotkey(self, keys: list[str], interval: float) -> None:
+        if not keys:
+            return
+        self._pyautogui.hotkey(*keys, interval=interval)
