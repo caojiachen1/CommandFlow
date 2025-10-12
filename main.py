@@ -13,11 +13,11 @@ import math
 import sys
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
 from automation_runtime import PyAutoGuiRuntime
 from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal
-from PySide6.QtGui import QColor, QDrag, QPainter, QPainterPath, QPen, QTransform
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPainterPath, QPen, QTransform
 from PySide6.QtWidgets import (
 	QApplication,
 	QComboBox,
@@ -46,7 +46,84 @@ from PySide6.QtWidgets import (
 	QVBoxLayout,
 	QWidget,
 	QAbstractItemView,
+	QStatusBar,
 )
+
+try:
+	from qfluentwidgets import (
+		FluentWindow,
+		Theme,
+		setTheme,
+		setThemeColor,
+		PrimaryPushButton,
+		BodyLabel,
+		InfoBar,
+		InfoBarPosition,
+		FluentTranslator,
+		MessageBox,
+		MessageBoxBase,
+		ComboBox as FluentComboBox,
+		SpinBox as FluentSpinBox,
+		DoubleSpinBox as FluentDoubleSpinBox,
+		LineEdit as FluentLineEdit,
+		TextEdit as FluentTextEdit,
+		SubtitleLabel,
+		FluentIcon,
+	)
+	HAVE_FLUENT_WIDGETS = True
+except ImportError:  # pragma: no cover - optional dependency
+	HAVE_FLUENT_WIDGETS = False
+	FluentWindow = QMainWindow  # type: ignore[assignment]
+	Theme = None
+
+	def setTheme(*_args, **_kwargs):  # type: ignore[func-name-matches]
+		return None
+
+	def setThemeColor(*_args, **_kwargs):  # type: ignore[func-name-matches]
+		return None
+
+	PrimaryPushButton = QPushButton  # type: ignore[assignment]
+	BodyLabel = QLabel  # type: ignore[assignment]
+
+	class _InfoBarStub:
+		@staticmethod
+		def success(*_args, **_kwargs):
+			return None
+
+	class _InfoBarPositionStub:
+		TOP_RIGHT = None
+
+	InfoBar = _InfoBarStub
+	InfoBarPosition = _InfoBarPositionStub
+	FluentTranslator = None
+	MessageBox = None
+
+	class _MessageBoxBase(QDialog):
+		pass
+
+	MessageBoxBase = _MessageBoxBase
+	FluentComboBox = QComboBox  # type: ignore[assignment]
+	FluentSpinBox = QSpinBox  # type: ignore[assignment]
+	FluentDoubleSpinBox = QDoubleSpinBox  # type: ignore[assignment]
+	FluentLineEdit = QLineEdit  # type: ignore[assignment]
+	FluentTextEdit = QTextEdit  # type: ignore[assignment]
+	SubtitleLabel = QLabel  # type: ignore[assignment]
+	FluentIcon = None
+else:
+	MessageBoxBase = cast(Type[QDialog], MessageBoxBase)
+
+BaseMainWindow: Type[QMainWindow]
+if HAVE_FLUENT_WIDGETS:
+	BaseMainWindow = cast(Type[QMainWindow], FluentWindow)
+else:
+	BaseMainWindow = QMainWindow
+
+ConfigDialogBase: Type[QDialog]
+if HAVE_FLUENT_WIDGETS:
+	ConfigDialogBase = cast(Type[QDialog], MessageBoxBase)
+else:
+	ConfigDialogBase = QDialog
+INFOBAR_AVAILABLE = HAVE_FLUENT_WIDGETS and InfoBar is not None and InfoBarPosition is not None
 
 from workflow_core import (
 	AutomationRuntime,
@@ -74,6 +151,31 @@ def configure_windows_dpi() -> None:
 			ctypes.windll.user32.SetProcessDPIAware()
 		except Exception:
 			pass
+
+
+def _show_message(parent: QWidget, title: str, message: str, kind: str) -> None:
+	if HAVE_FLUENT_WIDGETS and MessageBox is not None:
+		box = MessageBox(title, message, parent)
+		if hasattr(box, "cancelButton"):
+			box.cancelButton.hide()
+		if hasattr(box, "yesButton"):
+			text = "确认" if kind == "warning" else "确定"
+			box.yesButton.setText(text)
+		box.exec()
+		return
+
+	if kind == "warning":
+		QMessageBox.warning(parent, title, message)
+	else:
+		QMessageBox.information(parent, title, message)
+
+
+def show_information(parent: QWidget, title: str, message: str) -> None:
+	_show_message(parent, title, message, "info")
+
+
+def show_warning(parent: QWidget, title: str, message: str) -> None:
+	_show_message(parent, title, message, "warning")
 # -- GUI helpers -----------------------------------------------------------
 
 
@@ -599,36 +701,60 @@ class WorkflowScene(QGraphicsScene):
 # -- Configuration dialog --------------------------------------------------
 
 
-class ConfigDialog(QDialog):
+class ConfigDialog(ConfigDialogBase):
 	"""Generic configuration dialog built from a node schema."""
 
 	def __init__(self, node_model, parent: Optional[QWidget] = None) -> None:
 		super().__init__(parent)
-		self.setWindowTitle(f"配置 {node_model.title}")
 		self.node_model = node_model
 		self.widgets: Dict[str, QWidget] = {}
-		layout = QVBoxLayout(self)
-		form = QFormLayout()
+		self._build_layout(node_model)
+
+	def _build_layout(self, node_model) -> None:
+		form_container = QWidget(self)
+		form_layout = QFormLayout(form_container)
+		form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 		for field in node_model.config_schema():
 			widget = self._create_widget(field, node_model.config)
-			label = field.get("label", field["key"])
-			form.addRow(QLabel(label), widget)
+			label_text = field.get("label", field["key"])
+			label_widget: QWidget
+			if HAVE_FLUENT_WIDGETS:
+				label_widget = SubtitleLabel(label_text, form_container)
+			else:
+				label_widget = QLabel(label_text, form_container)
+			form_layout.addRow(label_widget, widget)
 			self.widgets[field["key"]] = widget
-		layout.addLayout(form)
-		buttons = QDialogButtonBox(
-			QDialogButtonBox.StandardButton.Ok
-			| QDialogButtonBox.StandardButton.Cancel
-		)
-		buttons.accepted.connect(self.accept)
-		buttons.rejected.connect(self.reject)
-		layout.addWidget(buttons)
+
+		if HAVE_FLUENT_WIDGETS:
+			self.titleLabel = SubtitleLabel(f"配置 {node_model.title}", self)
+			fluent_self = cast(Any, self)
+			fluent_self.viewLayout.addWidget(self.titleLabel)
+			fluent_self.viewLayout.addWidget(form_container)
+			if hasattr(fluent_self, "widget"):
+				fluent_self.widget.setMinimumWidth(420)
+			if hasattr(fluent_self, "yesButton"):
+				fluent_self.yesButton.setText("保存")
+			if hasattr(fluent_self, "cancelButton"):
+				fluent_self.cancelButton.setText("取消")
+		else:
+			self.setWindowTitle(f"配置 {node_model.title}")
+			layout = QVBoxLayout(self)
+			layout.addWidget(form_container)
+			buttons = QDialogButtonBox(
+				QDialogButtonBox.StandardButton.Ok
+				| QDialogButtonBox.StandardButton.Cancel
+			)
+			buttons.accepted.connect(self.accept)
+			buttons.rejected.connect(self.reject)
+			layout.addWidget(buttons)
 
 	def _create_widget(self, field: Dict[str, Any], values: Dict[str, Any]) -> QWidget:
 		key = cast(str, field["key"])
 		value = values.get(key)
 		ftype = cast(str, field.get("type", "str"))
 		if ftype == "int":
-			widget = QSpinBox(self)
+			widget_cls = FluentSpinBox if HAVE_FLUENT_WIDGETS else QSpinBox
+			widget = widget_cls(self)
 			widget.setRange(
 				int(cast(int, field.get("min", 0))),
 				int(cast(int, field.get("max", 10000))),
@@ -636,8 +762,10 @@ class ConfigDialog(QDialog):
 			widget.setValue(int(value) if value is not None else 0)
 			return widget
 		if ftype == "float":
-			widget = QDoubleSpinBox(self)
-			widget.setDecimals(3)
+			widget_cls = FluentDoubleSpinBox if HAVE_FLUENT_WIDGETS else QDoubleSpinBox
+			widget = widget_cls(self)
+			if hasattr(widget, "setDecimals"):
+				widget.setDecimals(3)
 			widget.setRange(
 				float(cast(float, field.get("min", 0.0))),
 				float(cast(float, field.get("max", 9999.0))),
@@ -646,7 +774,8 @@ class ConfigDialog(QDialog):
 			widget.setValue(float(value) if value is not None else 0.0)
 			return widget
 		if ftype == "choices":
-			widget = QComboBox(self)
+			widget_cls = FluentComboBox if HAVE_FLUENT_WIDGETS else QComboBox
+			widget = widget_cls(self)
 			choices = cast(List[Tuple[str, str]], field.get("choices", []))
 			for ident, label in choices:
 				widget.addItem(label, ident)
@@ -655,11 +784,13 @@ class ConfigDialog(QDialog):
 				widget.setCurrentIndex(index)
 			return widget
 		if ftype == "multiline":
-			widget = QTextEdit(self)
+			widget_cls = FluentTextEdit if HAVE_FLUENT_WIDGETS else QTextEdit
+			widget = widget_cls(self)
 			widget.setPlainText(str(value or ""))
 			widget.setMinimumHeight(80)
 			return widget
-		widget = QLineEdit(self)
+		widget_cls = FluentLineEdit if HAVE_FLUENT_WIDGETS else QLineEdit
+		widget = widget_cls(self)
 		widget.setText(str(value or ""))
 		return widget
 
@@ -719,16 +850,14 @@ class WorkflowRunner(QObject):
 			self._running = False
 
 
-# -- Main window -----------------------------------------------------------
+# -- Fluent workflow interface --------------------------------------------
 
 
-class MainWindow(QMainWindow):
-	"""Top-level window wiring palette, scene, and execution controls."""
+class WorkflowInterface(QWidget):
+	"""Workflow editor surface using Fluent UI components when available."""
 
-	def __init__(self) -> None:
-		super().__init__()
-		self.setWindowTitle("Workflow Capture Studio")
-		self.resize(1200, 720)
+	def __init__(self, parent: Optional[QWidget] = None) -> None:
+		super().__init__(parent)
 
 		self.scene = WorkflowScene(self)
 		self.scene.message_posted.connect(self.append_log)
@@ -739,13 +868,17 @@ class MainWindow(QMainWindow):
 
 		self.log_widget = QTextEdit(self)
 		self.log_widget.setReadOnly(True)
+		self.log_widget.setObjectName("workflowLog")
 
 		right_panel = QWidget(self)
 		right_layout = QVBoxLayout(right_panel)
-		self.run_button = QPushButton("运行工作流", right_panel)
+		right_layout.setContentsMargins(16, 16, 16, 16)
+		right_layout.setSpacing(12)
+		self.run_button = PrimaryPushButton("运行工作流", right_panel)
 		self.run_button.clicked.connect(self.execute_workflow)
 		right_layout.addWidget(self.run_button)
-		right_layout.addWidget(QLabel("日志"))
+		log_label = BodyLabel("日志", right_panel) if HAVE_FLUENT_WIDGETS else QLabel("日志", right_panel)
+		right_layout.addWidget(log_label)
 		right_layout.addWidget(self.log_widget, 1)
 
 		splitter = QSplitter(self)
@@ -753,12 +886,19 @@ class MainWindow(QMainWindow):
 		splitter.addWidget(self.view)
 		splitter.addWidget(right_panel)
 		splitter.setStretchFactor(1, 1)
-		splitter.setSizes([160, 640, 260])
+		splitter.setSizes([180, 720, 280])
+		splitter.setChildrenCollapsible(False)
 
-		container = QWidget(self)
-		layout = QHBoxLayout(container)
-		layout.addWidget(splitter)
-		self.setCentralWidget(container)
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(16, 16, 16, 16)
+		layout.setSpacing(12)
+		layout.addWidget(splitter, 1)
+
+		self.status_bar = QStatusBar(self)
+		self.status_bar.setSizeGripEnabled(False)
+		self.status_bar.setObjectName("workflowStatusBar")
+		layout.addWidget(self.status_bar)
+		self.show_status("就绪")
 
 		self.runner = WorkflowRunner(
 			graph_supplier=self.scene.graph.copy,
@@ -771,32 +911,46 @@ class MainWindow(QMainWindow):
 	def append_log(self, message: str) -> None:
 		timestamp = time.strftime("%H:%M:%S")
 		self.log_widget.append(f"[{timestamp}] {message}")
+		self.show_status(message)
+		if INFOBAR_AVAILABLE:
+			# Mirror log output in a Fluent info bar for quick visual feedback.
+			info_bar_cls = cast(Any, InfoBar)
+			position = cast(Any, InfoBarPosition.TOP_RIGHT)
+			info_bar_cls.success(
+				title="提示",
+				content=message,
+				orient=Qt.Orientation.Horizontal,
+				isClosable=True,
+				position=position,
+				duration=2000,
+				parent=self,
+			)
 
 	def configure_node(self, node_id: str) -> None:
 		node_model = self.scene.graph.nodes.get(node_id)
 		if node_model is None:
 			return
 		dialog = ConfigDialog(node_model, self)
-		if dialog.exec() != int(QDialog.DialogCode.Accepted):
+		if not dialog.exec():
 			return
 		new_values = dialog.values()
 		try:
 			node_model.config.update(new_values)
 			node_model.validate_config()
 		except ValueError as exc:
-			QMessageBox.warning(self, "配置错误", str(exc))
+			show_warning(self, "配置错误", str(exc))
 			return
 		self.scene.update_node_tooltip(node_id)
 		self.append_log(f"已更新 {node_model.title} 配置")
 
 	def execute_workflow(self) -> None:
 		if not self.scene.graph.nodes:
-			QMessageBox.information(self, "运行工作流", "请先添加节点")
+			show_information(self, "运行工作流", "请先添加节点")
 			return
 		try:
 			self.scene.graph.topological_order()
 		except ExecutionError as exc:
-			QMessageBox.warning(self, "拓扑错误", str(exc))
+			show_warning(self, "拓扑错误", str(exc))
 			return
 		self.run_button.setEnabled(False)
 		self.runner.run()
@@ -805,7 +959,41 @@ class MainWindow(QMainWindow):
 		self.run_button.setEnabled(True)
 		self.append_log(message)
 		if not success:
-			QMessageBox.warning(self, "执行失败", message)
+			show_warning(self, "执行失败", message)
+
+	def show_status(self, message: str, timeout_ms: int = 0) -> None:
+		self.status_bar.showMessage(message, timeout_ms)
+
+
+# -- Main window -----------------------------------------------------------
+
+
+class MainWindow(BaseMainWindow):
+	"""Top-level window hosting the workflow interface with Fluent styling."""
+
+	def __init__(self) -> None:
+		super().__init__()
+		self.setWindowTitle("Workflow Capture Studio")
+		self.resize(1200, 720)
+
+		self.workflow_interface = WorkflowInterface(self)
+		if HAVE_FLUENT_WIDGETS and isinstance(self, FluentWindow):
+			self.workflow_interface.setObjectName("workflow-interface")
+			icon = FluentIcon.HOME if FluentIcon is not None else QIcon()
+			fluent_window = cast(Any, self)
+			if hasattr(fluent_window, "addSubInterface"):
+				fluent_window.addSubInterface(self.workflow_interface, icon, "工作流")
+				if hasattr(fluent_window, "stackedWidget"):
+					fluent_window.stackedWidget.setCurrentWidget(self.workflow_interface)
+				navigation = getattr(fluent_window, "navigationInterface", None)
+				if navigation is not None:
+					navigation.setVisible(False)
+			elif hasattr(fluent_window, "setCentralWidget"):
+				fluent_window.setCentralWidget(self.workflow_interface)
+			if hasattr(fluent_window, "setMicaEffectEnabled"):
+				fluent_window.setMicaEffectEnabled(True)
+		else:
+			self.setCentralWidget(self.workflow_interface)
 
 
 # -- Application entry point ----------------------------------------------
@@ -814,6 +1002,15 @@ class MainWindow(QMainWindow):
 def main() -> None:
 	configure_windows_dpi()
 	app = QApplication(sys.argv)
+	if HAVE_FLUENT_WIDGETS:
+		app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)
+		if FluentTranslator is not None:
+			translator = FluentTranslator()
+			app.installTranslator(translator)
+			setattr(app, "_fluent_translator", translator)
+		if Theme is not None:
+			setTheme(Theme.AUTO)
+		setThemeColor(QColor(0, 120, 212), save=False)
 	window = MainWindow()
 	window.show()
 	sys.exit(app.exec())
