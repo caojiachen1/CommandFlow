@@ -1180,7 +1180,7 @@ class WorkflowInterface(QWidget):
 		QStatusBar#workflowStatusBar {
 			background: transparent;
 			border-top: 1px solid rgba(255, 255, 255, 30);
-			color: #aab6d5;
+			color: #ffffff;
 			font-size: 11pt;
 		}
 		QSplitter::handle {
