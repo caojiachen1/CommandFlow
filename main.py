@@ -16,8 +16,19 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
 from automation_runtime import PyAutoGuiRuntime
-from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal
-from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPainterPath, QPen, QTransform
+from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect
+from PySide6.QtGui import (
+	QColor,
+	QDrag,
+	QIcon,
+	QLinearGradient,
+	QPainter,
+	QPainterPath,
+	QPen,
+	QTransform,
+	QFont,
+	QTextOption,
+)
 from PySide6.QtWidgets import (
 	QApplication,
 	QComboBox,
@@ -47,6 +58,7 @@ from PySide6.QtWidgets import (
 	QWidget,
 	QAbstractItemView,
 	QStatusBar,
+	QFrame,
 )
 
 try:
@@ -184,16 +196,47 @@ class NodePalette(QListWidget):
 
 	def __init__(self, parent: Optional[QWidget] = None) -> None:
 		super().__init__(parent)
+		self.setObjectName("nodePalette")
 		self.setDragEnabled(True)
 		self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+		self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+		self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+		self.setFrameShape(QFrame.Shape.NoFrame)
+		self.setSpacing(4)
+		self.setUniformItemSizes(True)
+		self._apply_palette_style()
 		self.populate()
 
 	def populate(self) -> None:
 		self.clear()
-		for node in iter_registry():
+		for node in sorted(iter_registry(), key=lambda item: item.display_name.lower()):
 			item = QListWidgetItem(node.display_name)
 			item.setData(Qt.ItemDataRole.UserRole, node.type_name)
 			self.addItem(item)
+
+	def _apply_palette_style(self) -> None:
+		self.setStyleSheet(
+			"""
+			QListWidget#nodePalette {
+				background: transparent;
+				border: none;
+				padding: 8px;
+				color: #f2f6ff;
+			}
+			QListWidget#nodePalette::item {
+				padding: 8px 10px;
+				margin: 2px 0;
+				border-radius: 6px;
+			}
+			QListWidget#nodePalette::item:selected {
+				background: rgba(255, 255, 255, 40);
+				color: #ffffff;
+			}
+			QListWidget#nodePalette::item:hover {
+				background: rgba(255, 255, 255, 20);
+			}
+			"""
+		)
 
 	def startDrag(self, supported_actions: Qt.DropAction) -> None:  # noqa: N802
 		item = self.currentItem()
@@ -220,7 +263,7 @@ class WorkflowView(QGraphicsView):
 		)
 		self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
 		self.setViewportUpdateMode(
-			QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate
+			QGraphicsView.ViewportUpdateMode.FullViewportUpdate
 		)
 		self._panning = False
 		self._pan_start = QPoint()
@@ -323,11 +366,13 @@ class NodePort(QGraphicsEllipseItem):
 		super().__init__(-6, -6, 12, 12, parent)
 		self._is_hovered = False
 		self._is_highlighted = False
-		self._default_color = QColor(220, 220, 220)
-		self._hover_color = QColor(255, 200, 120)
-		self._highlight_color = QColor(255, 230, 150)
+		self._default_color = QColor(96, 146, 222)
+		self._hover_color = QColor(122, 170, 240)
+		self._highlight_color = QColor(200, 220, 255)
 		self.setBrush(self._default_color)
-		self.setPen(QPen(QColor(70, 70, 70), 1))
+		pen = QPen(QColor(18, 26, 42), 1.4)
+		pen.setCosmetic(True)
+		self.setPen(pen)
 		self.setFlag(
 			QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
 		)
@@ -378,7 +423,10 @@ class ConnectionItem(QGraphicsPathItem):
 		super().__init__()
 		self.source = source
 		self.target = target
-		self.setPen(QPen(QColor(90, 120, 255), 2))
+		pen = QPen(QColor(86, 156, 214), 3)
+		pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+		pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+		self.setPen(pen)
 		self.setZValue(-1)
 		self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
 		self.refresh_path()
@@ -413,11 +461,21 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.setFlag(
 			QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
 		)
-		self.setBrush(QColor(40, 40, 50))
-		self.setPen(QPen(QColor(90, 90, 110), 2))
+		self.setBrush(Qt.BrushStyle.NoBrush)
+		self.setPen(Qt.PenStyle.NoPen)
+		self.setAcceptHoverEvents(True)
+		self._hovered = False
+		self._base_color = QColor(48, 75, 130)
+		self._accent_color = QColor(96, 173, 255)
+		self._paint_margin = 8.0
 		self.title_item = QGraphicsTextItem(title, self)
-		self.title_item.setDefaultTextColor(QColor(245, 245, 245))
-		self.title_item.setPos(12, 10)
+		title_font = QFont(self.title_item.font())
+		title_font.setPointSizeF(title_font.pointSizeF() + 1.5)
+		title_font.setBold(True)
+		self.title_item.setFont(title_font)
+		self.title_item.setDefaultTextColor(QColor(235, 240, 255))
+		self.title_item.setPos(20, 14)
+		self.title_item.setZValue(1)
 		self.input_port = NodePort(self, "input")
 		self.output_port = NodePort(self, "output")
 		self.update_ports()
@@ -442,6 +500,72 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		scene.request_config(self.node_id)
 		super().mouseDoubleClickEvent(event)
 
+	def mousePressEvent(self, event):  # noqa: D401
+		scene = self.scene()
+		if scene is not None:
+			scene_obj = cast(WorkflowScene, scene)
+			scene_obj._promote_node(self)
+		super().mousePressEvent(event)
+
+	def hoverEnterEvent(self, event):  # noqa: D401
+		self._hovered = True
+		self.update()
+		super().hoverEnterEvent(event)
+
+	def hoverLeaveEvent(self, event):  # noqa: D401
+		self._hovered = False
+		self.update()
+		super().hoverLeaveEvent(event)
+
+	def boundingRect(self) -> QRectF:  # noqa: D401
+		rect = super().boundingRect()
+		margin = self._paint_margin
+		return rect.adjusted(-margin, -margin, margin, margin)
+
+	def paint(self, painter: QPainter, option, widget=None):  # noqa: D401
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+		inner_rect = self.rect().adjusted(1, 1, -1, -1)
+		body_path = QPainterPath()
+		body_path.addRoundedRect(inner_rect, 18, 18)
+		gradient = QLinearGradient(inner_rect.topLeft(), inner_rect.bottomLeft())
+		gradient.setColorAt(0.0, self._base_color.lighter(120))
+		gradient.setColorAt(0.45, self._base_color)
+		gradient.setColorAt(1.0, self._base_color.darker(120))
+		painter.fillPath(body_path, gradient)
+		border_color = QColor(70, 95, 145)
+		if self._hovered:
+			border_color = QColor(110, 160, 240)
+		if self.isSelected():
+			border_color = self._accent_color
+		border_pen = QPen(border_color, 2.2)
+		border_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+		painter.setPen(border_pen)
+		painter.drawPath(body_path)
+
+		header_rect = QRectF(inner_rect.left() + 8, inner_rect.top() + 8, inner_rect.width() - 16, 34)
+		header_path = QPainterPath()
+		header_path.addRoundedRect(header_rect, 10, 10)
+		clip_path = QPainterPath()
+		clip_path.addRoundedRect(inner_rect, 18, 18)
+		header_clip = clip_path.intersected(header_path)
+		header_gradient = QLinearGradient(header_rect.topLeft(), header_rect.bottomLeft())
+		header_gradient.setColorAt(0.0, self._accent_color.lighter(130))
+		header_gradient.setColorAt(1.0, self._accent_color.darker(110))
+		painter.save()
+		painter.setClipPath(header_clip)
+		painter.fillPath(header_path, header_gradient)
+		painter.restore()
+
+		glow_color = QColor(90, 140, 230, 90)
+		if self.isSelected():
+			glow_color = QColor(120, 186, 255, 120)
+		if self._hovered or self.isSelected():
+			glow_pen = QPen(glow_color, 6)
+			glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+			painter.setPen(glow_pen)
+			painter.drawPath(body_path)
+		painter.setPen(Qt.PenStyle.NoPen)
+
 
 # -- Workflow scene --------------------------------------------------------
 
@@ -461,6 +585,57 @@ class WorkflowScene(QGraphicsScene):
 		self._temp_connection: Optional[ConnectionItem] = None
 		self._temp_target_item: Optional[QGraphicsEllipseItem] = None
 		self._hover_port: Optional[NodePort] = None
+		self._z_counter = 0
+		self.setSceneRect(-4000, -4000, 8000, 8000)
+
+	def drawBackground(self, painter: QPainter, rect: QRectF | QRect) -> None:  # noqa: D401
+		grid_step = 28
+		major_every = 4
+		rectf = QRectF(rect)
+		left = int(math.floor(rectf.left() / grid_step) * grid_step)
+		right = int(math.ceil(rectf.right() / grid_step) * grid_step)
+		top = int(math.floor(rectf.top() / grid_step) * grid_step)
+		bottom = int(math.ceil(rectf.bottom() / grid_step) * grid_step)
+		minor_pen = QPen(QColor(70, 70, 70), 1)
+		minor_pen.setCosmetic(True)
+		major_pen = QPen(QColor(110, 110, 110), 1.4)
+		major_pen.setCosmetic(True)
+		vertical_minor: List[QLineF] = []
+		vertical_major: List[QLineF] = []
+		horizontal_minor: List[QLineF] = []
+		horizontal_major: List[QLineF] = []
+		x = left
+		index = 0
+		while x <= right:
+			line = QLineF(x, top, x, bottom)
+			if index % major_every == 0:
+				vertical_major.append(line)
+			else:
+				vertical_minor.append(line)
+			x += grid_step
+			index += 1
+		y = top
+		index = 0
+		while y <= bottom:
+			line = QLineF(left, y, right, y)
+			if index % major_every == 0:
+				horizontal_major.append(line)
+			else:
+				horizontal_minor.append(line)
+			y += grid_step
+			index += 1
+		if vertical_minor or horizontal_minor:
+			painter.setPen(minor_pen)
+			if vertical_minor:
+				painter.drawLines(vertical_minor)
+			if horizontal_minor:
+				painter.drawLines(horizontal_minor)
+		if vertical_major or horizontal_major:
+			painter.setPen(major_pen)
+			if vertical_major:
+				painter.drawLines(vertical_major)
+			if horizontal_major:
+				painter.drawLines(horizontal_major)
 
 	def create_node_from_palette(self, node_type: str, pos: QPointF) -> None:
 		node_id = self._generate_node_id(node_type)
@@ -474,9 +649,14 @@ class WorkflowScene(QGraphicsScene):
 		item.setPos(pos - QPointF(item.WIDTH / 2, item.HEIGHT / 2))
 		self.addItem(item)
 		self.node_items[node_id] = item
+		self._promote_node(item)
 		summary = self._format_node_summary(node_model.config)
 		item.setToolTip(summary)
 		self.message_posted.emit(f"已添加节点: {node_model.title}")
+
+	def _promote_node(self, item: "WorkflowNodeItem") -> None:
+		self._z_counter += 1
+		item.setZValue(float(self._z_counter))
 
 	def handle_port_press(self, port: NodePort) -> None:
 		if port.kind != "output":
@@ -687,6 +867,7 @@ class WorkflowScene(QGraphicsScene):
 		item = self.node_items[node_id]
 		item.setToolTip(self._format_node_summary(model.config))
 		item.set_title(model.title)
+		self._promote_node(item)
 
 	def _generate_node_id(self, node_type: str) -> str:
 		base = node_type.split("_")[0]
@@ -864,18 +1045,30 @@ class WorkflowInterface(QWidget):
 		self.scene.config_requested.connect(self.configure_node)
 
 		self.node_palette = NodePalette(self)
+		self.node_palette.setMinimumWidth(220)
 		self.view = WorkflowView(self.scene, self)
+		self.view.setObjectName("workflowView")
+		self.view.setFrameShape(QFrame.Shape.NoFrame)
+		self.view.setStyleSheet("QGraphicsView#workflowView { background: transparent; border: none; }")
 
 		self.log_widget = QTextEdit(self)
 		self.log_widget.setReadOnly(True)
 		self.log_widget.setObjectName("workflowLog")
+		log_font = QFont(self.log_widget.font())
+		log_font.setFamily("Consolas")
+		log_font.setPointSizeF(max(log_font.pointSizeF(), 9.5))
+		self.log_widget.setFont(log_font)
+		self.log_widget.setWordWrapMode(QTextOption.WrapMode.NoWrap)
 
 		right_panel = QWidget(self)
+		right_panel.setObjectName("workflowSidePanel")
 		right_layout = QVBoxLayout(right_panel)
 		right_layout.setContentsMargins(16, 16, 16, 16)
 		right_layout.setSpacing(12)
 		self.run_button = PrimaryPushButton("运行工作流", right_panel)
 		self.run_button.clicked.connect(self.execute_workflow)
+		self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
+		self.run_button.setMinimumHeight(40)
 		right_layout.addWidget(self.run_button)
 		log_label = BodyLabel("日志", right_panel) if HAVE_FLUENT_WIDGETS else QLabel("日志", right_panel)
 		right_layout.addWidget(log_label)
@@ -888,6 +1081,7 @@ class WorkflowInterface(QWidget):
 		splitter.setStretchFactor(1, 1)
 		splitter.setSizes([180, 720, 280])
 		splitter.setChildrenCollapsible(False)
+		splitter.setHandleWidth(4)
 
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(16, 16, 16, 16)
@@ -899,6 +1093,8 @@ class WorkflowInterface(QWidget):
 		self.status_bar.setObjectName("workflowStatusBar")
 		layout.addWidget(self.status_bar)
 		self.show_status("就绪")
+		self.setObjectName("workflowInterfaceRoot")
+		self._apply_styles()
 
 		self.runner = WorkflowRunner(
 			graph_supplier=self.scene.graph.copy,
@@ -963,6 +1159,57 @@ class WorkflowInterface(QWidget):
 
 	def show_status(self, message: str, timeout_ms: int = 0) -> None:
 		self.status_bar.showMessage(message, timeout_ms)
+
+	def _apply_styles(self) -> None:
+		base_style = """
+		#workflowInterfaceRoot {
+			background: transparent;
+		}
+		QWidget#workflowSidePanel {
+			background: transparent;
+			border: none;
+			border-radius: 12px;
+		}
+		QTextEdit#workflowLog {
+			background: transparent;
+			border: 1px solid rgba(255, 255, 255, 25);
+			border-radius: 10px;
+			padding: 8px;
+			color: #d6def0;
+		}
+		QStatusBar#workflowStatusBar {
+			background: transparent;
+			border-top: 1px solid rgba(255, 255, 255, 30);
+			color: #aab6d5;
+			font-size: 11pt;
+		}
+		QSplitter::handle {
+			background: rgba(255, 255, 255, 20);
+			width: 4px;
+			border-radius: 2px;
+		}
+		QSplitter::handle:hover {
+			background: rgba(255, 255, 255, 35);
+		}
+		"""
+		if not HAVE_FLUENT_WIDGETS:
+			base_style += """
+		QPushButton {
+			background: rgba(255, 255, 255, 20);
+			border: 1px solid rgba(255, 255, 255, 40);
+			border-radius: 10px;
+			padding: 10px 16px;
+			color: #ffffff;
+			font-weight: 600;
+		}
+		QPushButton:hover {
+			background: rgba(255, 255, 255, 35);
+		}
+		QPushButton:pressed {
+			background: rgba(255, 255, 255, 15);
+		}
+		"""
+		self.setStyleSheet(base_style)
 
 
 # -- Main window -----------------------------------------------------------
