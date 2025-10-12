@@ -15,7 +15,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
-from automation_runtime import PyAutoGuiRuntime
+from automation_runtime import PyAutoGuiRuntime, get_system_dpi_scale
 from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect
 from PySide6.QtGui import (
 	QColor,
@@ -1092,13 +1092,14 @@ class WorkflowInterface(QWidget):
 		self.status_bar.setSizeGripEnabled(False)
 		self.status_bar.setObjectName("workflowStatusBar")
 		layout.addWidget(self.status_bar)
-		self.show_status("就绪")
+		self._dpi_scale = get_system_dpi_scale()
+		self.show_status(f"就绪 (DPI缩放 {self._dpi_scale:.2f}x)")
 		self.setObjectName("workflowInterfaceRoot")
 		self._apply_styles()
 
 		self.runner = WorkflowRunner(
 			graph_supplier=self.scene.graph.copy,
-			runtime_factory=PyAutoGuiRuntime,
+			runtime_factory=lambda: PyAutoGuiRuntime(dpi_scale=self._dpi_scale),
 			parent=self,
 		)
 		self.runner.started.connect(lambda: self.append_log("开始执行工作流"))
