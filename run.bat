@@ -12,7 +12,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Launching screenshot automation GUI...
+echo Launching command automation GUI...
 python main.py
 
 set EXITCODE=%errorlevel%
