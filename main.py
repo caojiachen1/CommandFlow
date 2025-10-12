@@ -16,7 +16,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
 from automation_runtime import PyAutoGuiRuntime, get_system_dpi_scale
-from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect
+from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect, QSizeF
 from PySide6.QtGui import (
 	QColor,
 	QDrag,
@@ -255,6 +255,8 @@ class NodePalette(QListWidget):
 class WorkflowView(QGraphicsView):
 	"""Graphics view hosting the workflow scene."""
 
+	zoomChanged = Signal(float)
+
 	def __init__(self, scene: "WorkflowScene", parent: Optional[QWidget] = None) -> None:
 		super().__init__(scene, parent)
 		self.setAcceptDrops(True)
@@ -265,9 +267,15 @@ class WorkflowView(QGraphicsView):
 		self.setViewportUpdateMode(
 			QGraphicsView.ViewportUpdateMode.FullViewportUpdate
 		)
+		self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+		self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 		self._panning = False
 		self._pan_start = QPoint()
 		self._pan_scroll_start = QPoint()
+		self._zoom = 1.0
+		self._min_zoom = 0.2
+		self._max_zoom = 3.0
+		self._zoom_step = 1.15
 
 	def dragEnterEvent(self, event):  # noqa: D401
 		if event.mimeData().hasFormat("application/x-workflow-node"):
@@ -324,6 +332,45 @@ class WorkflowView(QGraphicsView):
 			event.accept()
 			return
 		super().mouseReleaseEvent(event)
+
+	def resizeEvent(self, event):  # noqa: D401
+		scene_obj = self.scene()
+		if scene_obj is not None:
+			scene = cast("WorkflowScene", scene_obj)
+			scene.handle_view_resize(QSizeF(self.viewport().size()))
+		super().resizeEvent(event)
+
+	def wheelEvent(self, event):  # noqa: D401
+		delta = event.angleDelta().y()
+		if delta == 0:
+			pixel_delta = event.pixelDelta()
+			delta = pixel_delta.y() if not pixel_delta.isNull() else 0
+		if delta == 0:
+			event.ignore()
+			return
+		steps = delta / 120.0
+		factor = math.pow(self._zoom_step, steps)
+		if self._apply_zoom(factor):
+			event.accept()
+		else:
+			event.ignore()
+
+	def _apply_zoom(self, factor: float) -> bool:
+		if factor <= 0:
+			return False
+		new_zoom = self._zoom * factor
+		if new_zoom < self._min_zoom:
+			factor = self._min_zoom / self._zoom
+			new_zoom = self._min_zoom
+		elif new_zoom > self._max_zoom:
+			factor = self._max_zoom / self._zoom
+			new_zoom = self._max_zoom
+		if math.isclose(new_zoom, self._zoom, rel_tol=1e-4):
+			return False
+		self.scale(factor, factor)
+		self._zoom = new_zoom
+		self.zoomChanged.emit(self._zoom)
+		return True
 
 	def _begin_panning(self, event) -> bool:
 		if event.button() in (
@@ -493,6 +540,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 			if scene_obj is not None:
 				scene = cast(WorkflowScene, scene_obj)
 				scene.refresh_connections(self)
+				scene.ensure_scene_visible(self)
 		return super().itemChange(change, value)
 
 	def mouseDoubleClickEvent(self, event):  # noqa: D401
@@ -586,7 +634,10 @@ class WorkflowScene(QGraphicsScene):
 		self._temp_target_item: Optional[QGraphicsEllipseItem] = None
 		self._hover_port: Optional[NodePort] = None
 		self._z_counter = 0
-		self.setSceneRect(-4000, -4000, 8000, 8000)
+		self._scene_threshold = 220.0
+		self._scene_growth_step = 800.0
+		self._default_scene_rect = QRectF(-400, -300, 800, 600)
+		self.setSceneRect(self._default_scene_rect)
 
 	def drawBackground(self, painter: QPainter, rect: QRectF | QRect) -> None:  # noqa: D401
 		grid_step = 28
@@ -637,6 +688,62 @@ class WorkflowScene(QGraphicsScene):
 			if horizontal_major:
 				painter.drawLines(horizontal_major)
 
+	def _expand_scene_for_rect(self, item_rect: QRectF) -> bool:
+		rect = self.sceneRect()
+		threshold = self._scene_threshold
+		step = self._scene_growth_step
+		expand_left = step if item_rect.left() < rect.left() + threshold else 0.0
+		expand_right = step if item_rect.right() > rect.right() - threshold else 0.0
+		expand_top = step if item_rect.top() < rect.top() + threshold else 0.0
+		expand_bottom = step if item_rect.bottom() > rect.bottom() - threshold else 0.0
+		if not any((expand_left, expand_right, expand_top, expand_bottom)):
+			return False
+		new_rect = QRectF(
+			rect.left() - expand_left,
+			rect.top() - expand_top,
+			rect.width() + expand_left + expand_right,
+			rect.height() + expand_top + expand_bottom,
+		)
+		self.setSceneRect(new_rect)
+		return True
+
+	def ensure_scene_visible(self, item: WorkflowNodeItem) -> None:
+		item_rect = item.sceneBoundingRect()
+		self._expand_scene_for_rect(item_rect)
+
+	def _update_scene_metrics(self, width: float, height: float) -> None:
+		short_edge = max(min(width, height), 200.0)
+		long_edge = max(max(width, height), 300.0)
+		self._scene_threshold = min(220.0, short_edge * 0.3)
+		self._scene_growth_step = max(400.0, long_edge * 0.5)
+
+	def handle_view_resize(self, size: QSizeF) -> None:
+		width = float(size.width())
+		height = float(size.height())
+		if width <= 0 or height <= 0:
+			return
+		self._update_scene_metrics(width, height)
+		default_rect = QRectF(-width / 2.0, -height / 2.0, width, height)
+		self._default_scene_rect = default_rect
+		if not self.node_items:
+			self.setSceneRect(default_rect)
+
+	def _recalculate_scene_rect(self) -> None:
+		if not self.node_items:
+			self.setSceneRect(QRectF(self._default_scene_rect))
+			return
+		items_rect = self.itemsBoundingRect()
+		padding = max(self._scene_threshold, self._scene_growth_step * 0.5)
+		expanded = items_rect.adjusted(-padding, -padding, padding, padding)
+		default_rect = self._default_scene_rect
+		left = min(expanded.left(), default_rect.left())
+		top = min(expanded.top(), default_rect.top())
+		right = max(expanded.right(), default_rect.right())
+		bottom = max(expanded.bottom(), default_rect.bottom())
+		final_rect = QRectF(QPointF(left, top), QPointF(right, bottom))
+		self.setSceneRect(final_rect)
+		self._update_scene_metrics(final_rect.width(), final_rect.height())
+
 	def create_node_from_palette(self, node_type: str, pos: QPointF) -> None:
 		node_id = self._generate_node_id(node_type)
 		try:
@@ -652,6 +759,7 @@ class WorkflowScene(QGraphicsScene):
 		self._promote_node(item)
 		summary = self._format_node_summary(node_model.config)
 		item.setToolTip(summary)
+		self.ensure_scene_visible(item)
 		self.message_posted.emit(f"已添加节点: {node_model.title}")
 
 	def _promote_node(self, item: "WorkflowNodeItem") -> None:
@@ -849,6 +957,7 @@ class WorkflowScene(QGraphicsScene):
 		del self.node_items[node_id]
 		self.graph.remove_node(node_id)
 		self.message_posted.emit(f"已删除节点 {node_id}")
+		self._recalculate_scene_rect()
 
 	def _remove_connection(self, connection: ConnectionItem) -> None:
 		source = cast(WorkflowNodeItem, connection.source.parentItem()).node_id
@@ -1050,6 +1159,7 @@ class WorkflowInterface(QWidget):
 		self.view.setObjectName("workflowView")
 		self.view.setFrameShape(QFrame.Shape.NoFrame)
 		self.view.setStyleSheet("QGraphicsView#workflowView { background: transparent; border: none; }")
+		self.view.zoomChanged.connect(lambda value: self.show_status(f"缩放 {value * 100:.0f}%"))
 
 		self.log_widget = QTextEdit(self)
 		self.log_widget.setReadOnly(True)
@@ -1139,6 +1249,10 @@ class WorkflowInterface(QWidget):
 			return
 		self.scene.update_node_tooltip(node_id)
 		self.append_log(f"已更新 {node_model.title} 配置")
+
+	def showEvent(self, event):  # noqa: D401
+		super().showEvent(event)
+		self.scene.handle_view_resize(QSizeF(self.view.viewport().size()))
 
 	def execute_workflow(self) -> None:
 		if not self.scene.graph.nodes:
