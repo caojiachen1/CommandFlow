@@ -7,6 +7,7 @@ backends.
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Tuple
@@ -283,3 +284,23 @@ class PyAutoGuiRuntime:
         if location is None:
             return None
         return self._unscale_value(location[0]), self._unscale_value(location[1])
+
+    def run_command(
+        self,
+        command: str,
+        timeout: float | None,
+        cwd: str | None,
+    ) -> Tuple[int, str, str]:
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"命令执行超时: {command}") from exc
+        return completed.returncode, completed.stdout, completed.stderr

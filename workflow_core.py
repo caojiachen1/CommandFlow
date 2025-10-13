@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, cast
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, cast
 
 
 class ExecutionError(RuntimeError):
@@ -76,6 +76,13 @@ class AutomationRuntime(Protocol):
         region: tuple[int, int, int, int] | None,
         grayscale: bool,
     ) -> tuple[int, int] | None: ...
+
+    def run_command(
+        self,
+        command: str,
+        timeout: float | None,
+        cwd: str | None,
+    ) -> Tuple[int, str, str]: ...
 
 
 @dataclass
@@ -1274,6 +1281,83 @@ class FileDeleteNode(WorkflowNodeModel):
         return "deleted"
 
 
+class CommandNode(WorkflowNodeModel):
+    type_name = "command"
+    display_name = "执行命令"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "command": "",
+            "working_dir": "",
+            "timeout": 60.0,
+            "on_error": "报错",
+        }
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        command = cfg.get("command")
+        if not isinstance(command, str):
+            raise ValueError("command 必须是字符串")
+        working_dir = cfg.get("working_dir", "")
+        if not isinstance(working_dir, str):
+            raise ValueError("working_dir 必须是字符串")
+        timeout = cfg.get("timeout", 60.0)
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeout 必须为数字") from exc
+        if timeout_value <= 0:
+            raise ValueError("timeout 必须大于 0")
+        on_error = cfg.get("on_error", "报错")
+        if on_error not in {"报错", "忽略"}:
+            raise ValueError("on_error 必须为 报错 或 忽略")
+        cfg["command"] = command.strip()
+        cfg["working_dir"] = working_dir.strip()
+        cfg["timeout"] = timeout_value
+        cfg["on_error"] = on_error
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "command", "label": "命令", "type": "str"},
+            {"key": "working_dir", "label": "工作目录(可空)", "type": "str"},
+            {
+                "key": "timeout",
+                "label": "超时(秒)",
+                "type": "float",
+                "min": 0.1,
+                "max": 600.0,
+                "step": 1.0,
+            },
+            {
+                "key": "on_error",
+                "label": "错误处理",
+                "type": "choices",
+                "choices": [("报错", "报错"), ("忽略", "忽略")],
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, Any]:
+        cfg = self.config
+        command = cfg.get("command", "")
+        if not command:
+            raise ExecutionError("命令未设置")
+        working_dir = cfg.get("working_dir") or None
+        timeout_value = float(cfg.get("timeout", 60.0))
+        try:
+            returncode, stdout, stderr = runtime.run_command(command, timeout_value, working_dir)
+        except Exception as exc:  # pragma: no cover - runtime error handling
+            raise ExecutionError(f"命令执行异常: {exc}") from exc
+        result = {
+            "returncode": int(returncode),
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+        if returncode != 0 and cfg.get("on_error") == "报错":
+            raise ExecutionError(f"命令执行失败 (code={returncode})")
+        context.record(self.id, result)
+        return result
+
+
 NODE_REGISTRY = {
     ScreenshotNode.type_name: ScreenshotNode,
     MouseClickNode.type_name: MouseClickNode,
@@ -1295,6 +1379,7 @@ NODE_REGISTRY = {
     FileCopyNode.type_name: FileCopyNode,
     FileMoveNode.type_name: FileMoveNode,
     FileDeleteNode.type_name: FileDeleteNode,
+    CommandNode.type_name: CommandNode,
 }
 
 
