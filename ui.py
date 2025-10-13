@@ -5,10 +5,13 @@ This module contains all GUI-related classes and functions, separated from the m
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import time
 import uuid
+from json import JSONDecodeError
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
 from automation_runtime import PyAutoGuiRuntime, get_system_dpi_scale
@@ -31,6 +34,7 @@ from PySide6.QtWidgets import (
 	QDialog,
 	QDialogButtonBox,
 	QDoubleSpinBox,
+	QFileDialog,
 	QFormLayout,
 	QGraphicsView,
 	QGraphicsEllipseItem,
@@ -560,6 +564,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 				scene = cast(WorkflowScene, scene_obj)
 				scene.refresh_connections(self)
 				scene.ensure_scene_visible(self)
+				scene.modified.emit()
 		return super().itemChange(change, value)
 
 	def mouseDoubleClickEvent(self, event):  # noqa: D401
@@ -635,6 +640,7 @@ class WorkflowScene(QGraphicsScene):
 
 	message_posted = Signal(str)
 	config_requested = Signal(str)
+	modified = Signal()
 
 	def __init__(self, parent: Optional[QObject] = None) -> None:
 		super().__init__(parent)
@@ -774,6 +780,7 @@ class WorkflowScene(QGraphicsScene):
 		item.setToolTip(summary)
 		self.ensure_scene_visible(item)
 		self.message_posted.emit(f"已添加节点: {node_model.title}")
+		self.modified.emit()
 
 	def _promote_node(self, item: "WorkflowNodeItem") -> None:
 		self._z_counter += 1
@@ -866,6 +873,7 @@ class WorkflowScene(QGraphicsScene):
 		self.addItem(connection)
 		self.message_posted.emit(f"已连接 {source_node} -> {target_node}")
 		self._clear_temp_line()
+		self.modified.emit()
 
 	def _clear_temp_line(self) -> None:
 		if self._temp_connection is not None:
@@ -971,6 +979,7 @@ class WorkflowScene(QGraphicsScene):
 		self.graph.remove_node(node_id)
 		self.message_posted.emit(f"已删除节点 {node_id}")
 		self._recalculate_scene_rect()
+		self.modified.emit()
 
 	def _remove_connection(self, connection: ConnectionItem) -> None:
 		source = cast(WorkflowNodeItem, connection.source.parentItem()).node_id
@@ -980,6 +989,7 @@ class WorkflowScene(QGraphicsScene):
 		if connection in self.connections:
 			self.connections.remove(connection)
 		self.message_posted.emit(f"已断开 {source} -> {target}")
+		self.modified.emit()
 
 	def request_config(self, node_id: str) -> None:
 		self.config_requested.emit(node_id)
@@ -990,6 +1000,7 @@ class WorkflowScene(QGraphicsScene):
 		item.setToolTip(self._format_node_summary(model.config))
 		item.set_title(model.title)
 		self._promote_node(item)
+		self.modified.emit()
 
 	def _generate_node_id(self, node_type: str) -> str:
 		base = node_type.split("_")[0]
@@ -999,6 +1010,103 @@ class WorkflowScene(QGraphicsScene):
 	def _format_node_summary(config: Dict[str, object]) -> str:
 		parts = [f"{key}: {value}" for key, value in config.items()]
 		return "\n".join(parts)
+
+	def clear_workflow(self, notify: bool = True, mark_modified: bool = True) -> None:
+		self._clear_temp_line()
+		self.clear()
+		self.graph = WorkflowGraph()
+		self.node_items.clear()
+		self.connections.clear()
+		self._pending_output = None
+		self._temp_connection = None
+		self._temp_target_item = None
+		self._hover_port = None
+		self._z_counter = 0
+		self.setSceneRect(QRectF(self._default_scene_rect))
+		if notify:
+			self.message_posted.emit("工作流已清空")
+		if mark_modified:
+			self.modified.emit()
+
+	def export_workflow(self) -> Dict[str, Any]:
+		nodes: List[Dict[str, Any]] = []
+		for node_id, node_model in self.graph.nodes.items():
+			item = self.node_items.get(node_id)
+			if item is None:
+				continue
+			pos = item.pos()
+			nodes.append(
+				{
+					"id": node_id,
+					"type": node_model.type_name,
+					"title": node_model.title,
+					"config": dict(node_model.config),
+					"position": {"x": float(pos.x()), "y": float(pos.y())},
+				}
+			)
+		edges: List[Dict[str, str]] = []
+		for source, targets in self.graph.edges.items():
+			for target in targets:
+				edges.append({"source": source, "target": target})
+		return {"schema": 1, "nodes": nodes, "edges": edges}
+
+	def import_workflow(self, data: Dict[str, Any], *, mark_modified: bool = False) -> None:
+		nodes_data = cast(List[Dict[str, Any]], data.get("nodes", []))
+		edges_data = cast(List[Dict[str, Any]], data.get("edges", []))
+		self.clear_workflow(notify=False, mark_modified=False)
+		for entry in nodes_data:
+			node_id = cast(str, entry.get("id"))
+			node_type = cast(str, entry.get("type"))
+			if not node_id or not node_type:
+				continue
+			try:
+				node_model = create_node(node_type, node_id)
+			except ValueError as exc:
+				self.message_posted.emit(f"忽略节点 {node_id}: {exc}")
+				continue
+			title = cast(str, entry.get("title", node_model.title))
+			config_values = entry.get("config", {})
+			if isinstance(config_values, dict):
+				node_model.config.update(config_values)
+			try:
+				node_model.validate_config()
+			except ValueError as exc:
+				self.message_posted.emit(f"节点 {node_id} 配置无效: {exc}")
+				continue
+			node_model.title = title
+			self.graph.add_node(node_model)
+			item = WorkflowNodeItem(node_id, node_model.title)
+			position = entry.get("position", {})
+			x_val = float(position.get("x", 0.0)) if isinstance(position, dict) else 0.0
+			y_val = float(position.get("y", 0.0)) if isinstance(position, dict) else 0.0
+			item.setPos(QPointF(x_val, y_val))
+			self.addItem(item)
+			self.node_items[node_id] = item
+			self._promote_node(item)
+			summary = self._format_node_summary(node_model.config)
+			item.setToolTip(summary)
+		for entry in edges_data:
+			source = cast(str, entry.get("source"))
+			target = cast(str, entry.get("target"))
+			if not source or not target:
+				continue
+			if source not in self.node_items or target not in self.node_items:
+				self.message_posted.emit(f"忽略无效连接 {source} -> {target}")
+				continue
+			try:
+				self.graph.add_edge(source, target)
+			except ValueError as exc:
+				self.message_posted.emit(f"连接 {source} -> {target} 失败: {exc}")
+				continue
+			connection = ConnectionItem(
+				self.node_items[source].output_port,
+				self.node_items[target].input_port,
+			)
+			self.connections.append(connection)
+			self.addItem(connection)
+		self._recalculate_scene_rect()
+		if mark_modified:
+			self.modified.emit()
 
 
 # -- Configuration dialog --------------------------------------------------
@@ -1161,6 +1269,11 @@ class WorkflowInterface(QWidget):
 
 	def __init__(self, parent: Optional[QWidget] = None) -> None:
 		super().__init__(parent)
+		self._current_workflow_path: Optional[Path] = None
+		self._unsaved_changes = False
+		self._last_directory = str(Path.home())
+		self._workflow_filter = "JSON Files (*.json);;All Files (*.*)"
+		self._window_base_title = "Command Flow Studio"
 
 		self.scene = WorkflowScene(self)
 		self.scene.message_posted.connect(self.append_log)
@@ -1188,6 +1301,32 @@ class WorkflowInterface(QWidget):
 		right_layout = QVBoxLayout(right_panel)
 		right_layout.setContentsMargins(16, 16, 16, 16)
 		right_layout.setSpacing(12)
+		file_controls_top = QHBoxLayout()
+		file_controls_top.setContentsMargins(0, 0, 0, 0)
+		file_controls_top.setSpacing(8)
+		self.new_workflow_button = self._make_side_button("新建", right_panel)
+		self.new_workflow_button.clicked.connect(self.new_workflow)
+		file_controls_top.addWidget(self.new_workflow_button)
+		self.open_workflow_button = self._make_side_button("打开", right_panel)
+		self.open_workflow_button.clicked.connect(self.open_workflow)
+		file_controls_top.addWidget(self.open_workflow_button)
+		self.save_workflow_button = self._make_side_button("保存", right_panel)
+		self.save_workflow_button.clicked.connect(self.save_workflow)
+		file_controls_top.addWidget(self.save_workflow_button)
+		right_layout.addLayout(file_controls_top)
+		file_controls_bottom = QHBoxLayout()
+		file_controls_bottom.setContentsMargins(0, 0, 0, 0)
+		file_controls_bottom.setSpacing(8)
+		self.save_as_workflow_button = self._make_side_button("另存为", right_panel)
+		self.save_as_workflow_button.clicked.connect(self.save_workflow_as)
+		file_controls_bottom.addWidget(self.save_as_workflow_button)
+		self.delete_workflow_button = self._make_side_button("删除", right_panel)
+		self.delete_workflow_button.clicked.connect(self.delete_workflow_file)
+		file_controls_bottom.addWidget(self.delete_workflow_button)
+		file_controls_bottom.addStretch(1)
+		right_layout.addLayout(file_controls_bottom)
+		self.file_label = BodyLabel("当前文件: 未命名", right_panel) if HAVE_FLUENT_WIDGETS else QLabel("当前文件: 未命名", right_panel)
+		right_layout.addWidget(self.file_label)
 		self.run_button = PrimaryPushButton("运行工作流", right_panel)
 		self.run_button.clicked.connect(self.execute_workflow)
 		self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1246,12 +1385,14 @@ class WorkflowInterface(QWidget):
 		self._apply_styles()
 
 		self.runner = WorkflowRunner(
-			graph_supplier=self.scene.graph.copy,
+			graph_supplier=lambda: self.scene.graph.copy(),
 			runtime_factory=lambda: PyAutoGuiRuntime(dpi_scale=self._dpi_scale),
 			parent=self,
 		)
 		self.runner.started.connect(lambda: self.append_log("开始执行工作流"))
 		self.runner.finished.connect(self.on_execution_finished)
+		self.scene.modified.connect(self.mark_workflow_modified)
+		self.update_file_display()
 
 	def _make_side_button(self, text: str, parent: QWidget) -> QPushButton:
 		button = QPushButton(text, parent)
@@ -1289,6 +1430,167 @@ class WorkflowInterface(QWidget):
 	def clear_log(self) -> None:
 		self.log_widget.clear()
 		self.show_status("日志已清空", 2000)
+
+	def set_base_window_title(self, title: str) -> None:
+		self._window_base_title = title or self._window_base_title
+		self.update_file_display()
+
+	def update_file_display(self) -> None:
+		filename = self._current_workflow_path.name if self._current_workflow_path else "未命名"
+		suffix = "*" if self._unsaved_changes else ""
+		self.file_label.setText(f"当前文件: {filename}{suffix}")
+		self.delete_workflow_button.setEnabled(self._current_workflow_path is not None)
+		self.update_window_title()
+
+	def update_window_title(self) -> None:
+		window = self.window()
+		if window is None or not hasattr(window, "setWindowTitle"):
+			return
+		if self._current_workflow_path is not None:
+			title = f"{self._window_base_title} - {self._current_workflow_path.name}"
+		else:
+			title = f"{self._window_base_title} - 未命名"
+		if self._unsaved_changes:
+			title += " *"
+		window.setWindowTitle(title)
+
+	def mark_workflow_modified(self) -> None:
+		state_changed = not self._unsaved_changes
+		self._unsaved_changes = True
+		if state_changed:
+			self.update_file_display()
+			self.show_status("工作流已修改", 2000)
+
+	def confirm_discard_changes(self) -> bool:
+		if not self._unsaved_changes:
+			return True
+		reply = QMessageBox.question(
+			self,
+			"放弃未保存的更改",
+			"当前工作流存在未保存的更改，是否继续？",
+			QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+			QMessageBox.StandardButton.No,
+		)
+		return reply == QMessageBox.StandardButton.Yes
+
+	def new_workflow(self) -> None:
+		if not self.confirm_discard_changes():
+			return
+		self.scene.clear_workflow(notify=True, mark_modified=False)
+		self._current_workflow_path = None
+		self._unsaved_changes = False
+		self.update_file_display()
+		self.append_log("已创建新的空白工作流")
+
+	def open_workflow(self) -> None:
+		if not self.confirm_discard_changes():
+			return
+		file_path, _ = QFileDialog.getOpenFileName(
+			self,
+			"打开工作流",
+			self._last_directory,
+			self._workflow_filter,
+		)
+		if not file_path:
+			return
+		path = Path(file_path)
+		try:
+			with path.open("r", encoding="utf-8") as handle:
+				data = json.load(handle)
+		except (OSError, JSONDecodeError) as exc:
+			show_warning(self, "打开失败", f"无法读取文件: {exc}")
+			return
+		self.scene.import_workflow(data, mark_modified=False)
+		self._current_workflow_path = path
+		self._last_directory = str(path.parent)
+		self._unsaved_changes = False
+		self.update_file_display()
+		self.append_log(f"已打开工作流: {path.name}")
+
+	def save_workflow(self) -> None:
+		if self._current_workflow_path is None:
+			self.save_workflow_as()
+			return
+		self._save_to_path(self._current_workflow_path)
+
+	def save_workflow_as(self) -> None:
+		directory = Path(self._last_directory)
+		if not directory.exists():
+			directory = Path.home()
+		default_name = (
+			self._current_workflow_path.name
+			if self._current_workflow_path is not None
+			else "workflow.json"
+		)
+		initial_path = str((directory / default_name).resolve())
+		file_path, _ = QFileDialog.getSaveFileName(
+			self,
+			"另存工作流",
+			initial_path,
+			self._workflow_filter,
+		)
+		if not file_path:
+			return
+		path = Path(file_path)
+		if path.suffix == "":
+			path = path.with_suffix(".json")
+		if self._save_to_path(path):
+			self._current_workflow_path = path
+
+	def delete_workflow_file(self) -> None:
+		if self._current_workflow_path is None:
+			show_information(self, "删除工作流", "当前没有关联的工作流文件")
+			return
+		path = self._current_workflow_path
+		if HAVE_FLUENT_WIDGETS and MessageBox is not None:
+			box = MessageBox("删除工作流", f"确定要删除文件 {path.name} 吗？", self)
+			if hasattr(box, "yesButton"):
+				box.yesButton.setText("删除")
+			if hasattr(box, "cancelButton"):
+				box.cancelButton.setText("取消")
+				box.cancelButton.show()
+			if box.exec() != QDialog.DialogCode.Accepted:
+				return
+		else:
+			reply = QMessageBox.question(
+				self,
+				"删除工作流",
+				f"确定要删除文件 {path.name} 吗？",
+				QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+				QMessageBox.StandardButton.No,
+			)
+			if reply != QMessageBox.StandardButton.Yes:
+				return
+		file_existed = path.exists()
+		try:
+			if file_existed:
+				path.unlink()
+		except OSError as exc:
+			show_warning(self, "删除失败", f"无法删除文件: {exc}")
+			return
+		if file_existed:
+			self.append_log(f"已删除工作流文件: {path.name}")
+		else:
+			self.append_log(f"目标文件不存在，已重置关联: {path.name}")
+		self._last_directory = str(path.parent)
+		self._current_workflow_path = None
+		self._unsaved_changes = True
+		self.update_file_display()
+		self.show_status("文件已删除，请另存为新文件", 4000)
+
+	def _save_to_path(self, path: Path) -> bool:
+		data = self.scene.export_workflow()
+		try:
+			path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+		except OSError as exc:
+			show_warning(self, "保存失败", f"无法写入文件: {exc}")
+			return False
+		self._current_workflow_path = path
+		self._last_directory = str(path.parent)
+		self._unsaved_changes = False
+		self.update_file_display()
+		self.append_log(f"已保存工作流: {path.name}")
+		return True
 
 	def append_log(self, message: str) -> None:
 		timestamp = time.strftime("%H:%M:%S")
@@ -1445,3 +1747,4 @@ class MainWindow(BaseMainWindow):
 				fluent_window.setMicaEffectEnabled(True)
 		else:
 			self.setCentralWidget(self.workflow_interface)
+		self.workflow_interface.set_base_window_title(self.windowTitle())
