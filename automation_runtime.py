@@ -99,6 +99,11 @@ class PyAutoGuiRuntime:
         scaled_y = self._scale_value(y, 0) if y is not None else None
         return scaled_x, scaled_y
 
+    def _unscale_value(self, value: int) -> int:
+        if self._dpi_scale == 0:
+            return value
+        return int(round(value / self._dpi_scale))
+
     def take_screenshot(self, region: Tuple[int, int, int, int]) -> Path:
         x, y, width, height = region
         scaled_region = (
@@ -220,3 +225,61 @@ class PyAutoGuiRuntime:
         if not keys:
             return
         self._pyautogui.hotkey(*keys, interval=interval)
+
+    def get_pixel_color(self, x: int, y: int) -> tuple[int, int, int]:
+        scaled_x, scaled_y = self._scale_point(x, y)
+        try:
+            color = self._pyautogui.pixel(scaled_x, scaled_y)
+        except Exception:
+            screenshot = self._pyautogui.screenshot()
+            color = screenshot.getpixel((scaled_x, scaled_y))
+        return int(color[0]), int(color[1]), int(color[2])
+
+    def locate_image(
+        self,
+        image_path: str,
+        confidence: float,
+        region: tuple[int, int, int, int] | None,
+        grayscale: bool,
+    ) -> tuple[int, int] | None:
+        scaled_region: tuple[int, int, int, int] | None = None
+        if region is not None:
+            scaled_region = (
+                self._scale_value(region[0], 0),
+                self._scale_value(region[1], 0),
+                self._scale_value(region[2], 1),
+                self._scale_value(region[3], 1),
+            )
+        locate_center = getattr(self._pyautogui, "locateCenterOnScreen", None)
+        if locate_center is None:
+            raise RuntimeError("PyAutoGUI locateCenterOnScreen is unavailable")
+        kwargs: dict[str, Any] = {"grayscale": grayscale}
+        if scaled_region is not None:
+            kwargs["region"] = scaled_region
+        try:
+            location = locate_center(
+                image_path,
+                confidence=confidence,
+                **kwargs,
+            )
+        except TypeError:
+            retry_kwargs = kwargs.copy()
+            co_varnames = getattr(getattr(locate_center, "__code__", None), "co_varnames", ())
+            if "confidence" in co_varnames:
+                retry_kwargs["confidence"] = confidence
+            else:
+                if confidence < 1.0:
+                    raise RuntimeError(
+                        "PyAutoGUI locateCenterOnScreen requires OpenCV for confidence parameter"
+                    )
+            if "grayscale" not in co_varnames:
+                retry_kwargs.pop("grayscale", None)
+            try:
+                location = locate_center(image_path, **retry_kwargs)
+            except TypeError as exc:
+                raise RuntimeError(
+                    "当前 PyAutoGUI 版本不支持提供的 locateCenterOnScreen 参数"
+                ) from exc
+        if location is None:
+            return None
+        return self._unscale_value(location[0]), self._unscale_value(location[1])

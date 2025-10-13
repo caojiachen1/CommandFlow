@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import shutil
+import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol
+from typing import Any, Dict, Iterable, List, Optional, Protocol, cast
 
 
 class ExecutionError(RuntimeError):
@@ -65,6 +66,16 @@ class AutomationRuntime(Protocol):
     def key_up(self, key: str) -> None: ...
 
     def press_hotkey(self, keys: list[str], interval: float) -> None: ...
+
+    def get_pixel_color(self, x: int, y: int) -> tuple[int, int, int]: ...
+
+    def locate_image(
+        self,
+        image_path: str,
+        confidence: float,
+        region: tuple[int, int, int, int] | None,
+        grayscale: bool,
+    ) -> tuple[int, int] | None: ...
 
 
 @dataclass
@@ -662,6 +673,353 @@ class KeyUpNode(WorkflowNodeModel):
         return None
 
 
+class DelayNode(WorkflowNodeModel):
+    type_name = "delay"
+    display_name = "延迟等待"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"seconds": 1.0}
+
+    def validate_config(self) -> None:
+        seconds = self.config.get("seconds")
+        if not isinstance(seconds, (int, float)) or seconds < 0:
+            raise ValueError("seconds must be non-negative")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "seconds",
+                "label": "等待秒数",
+                "type": "float",
+                "min": 0.0,
+                "max": 3600.0,
+                "step": 0.1,
+            }
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:  # noqa: ARG002
+        time.sleep(float(self.config["seconds"]))
+        context.record(self.id, "ok")
+        return None
+
+
+class ImageLocateNode(WorkflowNodeModel):
+    type_name = "image_locate"
+    display_name = "图像定位"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "image_path": "",
+            "confidence": 0.9,
+            "grayscale": "no",
+            "region_x": "",
+            "region_y": "",
+            "region_width": "",
+            "region_height": "",
+        }
+
+    @staticmethod
+    def _parse_optional_int(value: Any, field_name: str) -> int | None:
+        if value in ("", None):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError as exc:
+                raise ValueError(f"{field_name} 必须为整数或留空") from exc
+        raise ValueError(f"{field_name} 必须为整数或留空")
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        image_path = cfg.get("image_path")
+        if not isinstance(image_path, str):
+            raise ValueError("image_path must be a string")
+        cfg["image_path"] = image_path.strip()
+        confidence = cfg.get("confidence")
+        if not isinstance(confidence, (int, float)):
+            raise ValueError("confidence must be a number")
+        confidence_val = float(confidence)
+        if not 0.0 < confidence_val <= 1.0:
+            raise ValueError("confidence must be in (0, 1]")
+        cfg["confidence"] = confidence_val
+        grayscale = cfg.get("grayscale", "no")
+        if grayscale not in {"yes", "no"}:
+            raise ValueError("grayscale must be 'yes' or 'no'")
+        cfg["region_x"] = self._parse_optional_int(cfg.get("region_x"), "region_x")
+        cfg["region_y"] = self._parse_optional_int(cfg.get("region_y"), "region_y")
+        cfg["region_width"] = self._parse_optional_int(cfg.get("region_width"), "region_width")
+        cfg["region_height"] = self._parse_optional_int(cfg.get("region_height"), "region_height")
+        width = cfg["region_width"]
+        height = cfg["region_height"]
+        if width is not None and width <= 0:
+            raise ValueError("region_width must be positive when provided")
+        if height is not None and height <= 0:
+            raise ValueError("region_height must be positive when provided")
+        has_partial_region = any(
+            value is not None
+            for value in (
+                cfg["region_x"],
+                cfg["region_y"],
+                cfg["region_width"],
+                cfg["region_height"],
+            )
+        )
+        if has_partial_region and not all(
+            value is not None
+            for value in (
+                cfg["region_x"],
+                cfg["region_y"],
+                cfg["region_width"],
+                cfg["region_height"],
+            )
+        ):
+            raise ValueError("region fields must be all provided or all empty")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "image_path", "label": "图像路径", "type": "str"},
+            {
+                "key": "confidence",
+                "label": "匹配度",
+                "type": "float",
+                "min": 0.1,
+                "max": 1.0,
+                "step": 0.01,
+            },
+            {
+                "key": "grayscale",
+                "label": "灰度匹配",
+                "type": "choices",
+                "choices": [("no", "否"), ("yes", "是")],
+            },
+            {"key": "region_x", "label": "区域X(可空)", "type": "str"},
+            {"key": "region_y", "label": "区域Y(可空)", "type": "str"},
+            {"key": "region_width", "label": "区域宽度(可空)", "type": "str"},
+            {"key": "region_height", "label": "区域高度(可空)", "type": "str"},
+        ]
+
+    def _build_region(self) -> tuple[int, int, int, int] | None:
+        cfg = self.config
+        if cfg["region_x"] is None:
+            return None
+        return (
+            int(cfg["region_x"]),
+            int(cfg["region_y"]),
+            int(cfg["region_width"]),
+            int(cfg["region_height"]),
+        )
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, int]:
+        cfg = self.config
+        region = self._build_region()
+        image_path = cfg["image_path"]
+        if not image_path:
+            raise ExecutionError("图像路径不能为空")
+        location = runtime.locate_image(
+            image_path,
+            float(cfg["confidence"]),
+            region,
+            cfg["grayscale"] == "yes",
+        )
+        if location is None:
+            raise ExecutionError("未能在屏幕上找到目标图像")
+        result = {"x": location[0], "y": location[1]}
+        context.record(self.id, result)
+        return result
+
+
+class WaitForImageNode(ImageLocateNode):
+    type_name = "wait_for_image"
+    display_name = "等待图像出现"
+
+    def default_config(self) -> Dict[str, Any]:
+        base = super().default_config()
+        base.update({"timeout": 10.0, "poll_interval": 0.5})
+        return base
+
+    def validate_config(self) -> None:
+        super().validate_config()
+        timeout = self.config.get("timeout")
+        poll = self.config.get("poll_interval")
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if not isinstance(poll, (int, float)) or poll <= 0:
+            raise ValueError("poll_interval must be positive")
+        if float(poll) > float(timeout):
+            raise ValueError("poll_interval must not exceed timeout")
+        self.config["timeout"] = float(timeout)
+        self.config["poll_interval"] = float(poll)
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        base = super().config_schema()
+        base.extend(
+            [
+                {
+                    "key": "timeout",
+                    "label": "超时时间(秒)",
+                    "type": "float",
+                    "min": 0.1,
+                    "max": 3600.0,
+                    "step": 0.1,
+                },
+                {
+                    "key": "poll_interval",
+                    "label": "轮询间隔(秒)",
+                    "type": "float",
+                    "min": 0.1,
+                    "max": 60.0,
+                    "step": 0.1,
+                },
+            ]
+        )
+        return base
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, int]:
+        cfg = self.config
+        deadline = time.monotonic() + float(cfg["timeout"])
+        image_path = cfg["image_path"]
+        if not image_path:
+            raise ExecutionError("图像路径不能为空")
+        while True:
+            region = self._build_region()
+            location = runtime.locate_image(
+                image_path,
+                float(cfg["confidence"]),
+                region,
+                cfg["grayscale"] == "yes",
+            )
+            if location is not None:
+                result = {"x": location[0], "y": location[1]}
+                context.record(self.id, result)
+                return result
+            if time.monotonic() >= deadline:
+                raise ExecutionError("等待图像超时")
+            time.sleep(float(cfg["poll_interval"]))
+
+
+class PixelColorNode(WorkflowNodeModel):
+    type_name = "pixel_color"
+    display_name = "读取像素颜色"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "x": 0,
+            "y": 0,
+            "expect_r": "",
+            "expect_g": "",
+            "expect_b": "",
+            "tolerance": 10,
+        }
+
+    def _parse_optional_color(self, value: Any, channel: str) -> int | None:
+        if value in ("", None):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError as exc:
+                raise ValueError(f"{channel} 必须为 0-255 的整数或留空") from exc
+        raise ValueError(f"{channel} 必须为 0-255 的整数或留空")
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        for axis in ("x", "y"):
+            if not isinstance(cfg.get(axis), int):
+                raise ValueError(f"{axis} must be an integer")
+        tolerance = cfg.get("tolerance")
+        if not isinstance(tolerance, int) or tolerance < 0:
+            raise ValueError("tolerance must be a non-negative integer")
+        for channel in ("expect_r", "expect_g", "expect_b"):
+            value = self._parse_optional_color(cfg.get(channel), channel)
+            if value is not None and not 0 <= value <= 255:
+                raise ValueError(f"{channel} must be between 0 and 255")
+            cfg[channel] = value
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "x", "label": "X", "type": "int", "min": 0, "max": 10000},
+            {"key": "y", "label": "Y", "type": "int", "min": 0, "max": 10000},
+            {"key": "expect_r", "label": "期望R(可空)", "type": "str"},
+            {"key": "expect_g", "label": "期望G(可空)", "type": "str"},
+            {"key": "expect_b", "label": "期望B(可空)", "type": "str"},
+            {
+                "key": "tolerance",
+                "label": "容差",
+                "type": "int",
+                "min": 0,
+                "max": 255,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, int]:
+        cfg = self.config
+        r, g, b = runtime.get_pixel_color(cfg["x"], cfg["y"])
+        result = {"r": r, "g": g, "b": b}
+        expect_r = cfg.get("expect_r")
+        expect_g = cfg.get("expect_g")
+        expect_b = cfg.get("expect_b")
+        tolerance = int(cfg.get("tolerance", 0))
+        if all(channel is not None for channel in (expect_r, expect_g, expect_b)):
+            exp_r = int(cast(int, expect_r))
+            exp_g = int(cast(int, expect_g))
+            exp_b = int(cast(int, expect_b))
+            if not (
+                abs(r - exp_r) <= tolerance
+                and abs(g - exp_g) <= tolerance
+                and abs(b - exp_b) <= tolerance
+            ):
+                raise ExecutionError("像素颜色与期望值不匹配")
+        context.record(self.id, result)
+        return result
+
+
+class MoveMouseToResultNode(WorkflowNodeModel):
+    type_name = "move_to_result"
+    display_name = "移动到结果坐标"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"source_node": "", "duration": 0.2}
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        source = cfg.get("source_node")
+        if not isinstance(source, str):
+            raise ValueError("source_node must be a string")
+        cfg["source_node"] = source.strip()
+        duration = cfg.get("duration")
+        if not isinstance(duration, (int, float)) or duration < 0:
+            raise ValueError("duration must be non-negative")
+        cfg["duration"] = float(duration)
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "source_node", "label": "来源节点ID", "type": "str"},
+            {
+                "key": "duration",
+                "label": "移动时长",
+                "type": "float",
+                "min": 0.0,
+                "max": 5.0,
+                "step": 0.05,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        source_id = self.config["source_node"]
+        if not source_id:
+            raise ExecutionError("来源节点ID 未设置")
+        result = context.get(source_id)
+        if not isinstance(result, dict) or "x" not in result or "y" not in result:
+            raise ExecutionError("来源节点的结果不包含坐标信息")
+        runtime.move_mouse(int(result["x"]), int(result["y"]), float(self.config["duration"]))
+        context.record(self.id, {"x": int(result["x"]), "y": int(result["y"])})
+        return None
+
+
 NODE_REGISTRY = {
     ScreenshotNode.type_name: ScreenshotNode,
     MouseClickNode.type_name: MouseClickNode,
@@ -675,6 +1033,11 @@ NODE_REGISTRY = {
     HotkeyNode.type_name: HotkeyNode,
     KeyDownNode.type_name: KeyDownNode,
     KeyUpNode.type_name: KeyUpNode,
+    DelayNode.type_name: DelayNode,
+    ImageLocateNode.type_name: ImageLocateNode,
+    WaitForImageNode.type_name: WaitForImageNode,
+    PixelColorNode.type_name: PixelColorNode,
+    MoveMouseToResultNode.type_name: MoveMouseToResultNode,
 }
 
 
