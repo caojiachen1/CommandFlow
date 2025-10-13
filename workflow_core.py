@@ -103,6 +103,7 @@ class WorkflowNodeModel:
 
     type_name: str = "base"
     display_name: str = "Base"
+    category: str = "其他"
 
     def __init__(
         self,
@@ -139,6 +140,7 @@ class WorkflowNodeModel:
 class ScreenshotNode(WorkflowNodeModel):
     type_name = "screenshot"
     display_name = "截图"
+    category = "图像识别"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -210,6 +212,7 @@ class ScreenshotNode(WorkflowNodeModel):
 class MouseClickNode(WorkflowNodeModel):
     type_name = "mouse_click"
     display_name = "鼠标点击"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -277,6 +280,7 @@ class MouseClickNode(WorkflowNodeModel):
 class KeyboardInputNode(WorkflowNodeModel):
     type_name = "keyboard_input"
     display_name = "键盘输入"
+    category = "键盘操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -314,6 +318,7 @@ class KeyboardInputNode(WorkflowNodeModel):
 class MouseMoveNode(WorkflowNodeModel):
     type_name = "mouse_move"
     display_name = "鼠标移动"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"x": 100, "y": 100, "duration": 0.2}
@@ -351,6 +356,7 @@ class MouseMoveNode(WorkflowNodeModel):
 class MouseDragNode(WorkflowNodeModel):
     type_name = "mouse_drag"
     display_name = "鼠标拖拽"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -423,6 +429,7 @@ class MouseDragNode(WorkflowNodeModel):
 class MouseScrollNode(WorkflowNodeModel):
     type_name = "mouse_scroll"
     display_name = "鼠标滚轮"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -490,6 +497,7 @@ class MouseScrollNode(WorkflowNodeModel):
 class MouseDownNode(WorkflowNodeModel):
     type_name = "mouse_down"
     display_name = "鼠标按下"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"x": 100, "y": 100, "button": "left"}
@@ -524,6 +532,7 @@ class MouseDownNode(WorkflowNodeModel):
 class MouseUpNode(WorkflowNodeModel):
     type_name = "mouse_up"
     display_name = "鼠标抬起"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"x": 100, "y": 100, "button": "left"}
@@ -558,6 +567,7 @@ class MouseUpNode(WorkflowNodeModel):
 class KeyPressNode(WorkflowNodeModel):
     type_name = "key_press"
     display_name = "按键触发"
+    category = "键盘操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"key": "enter", "presses": 1, "interval": 0.05}
@@ -603,6 +613,7 @@ class KeyPressNode(WorkflowNodeModel):
 class HotkeyNode(WorkflowNodeModel):
     type_name = "hotkey"
     display_name = "组合按键"
+    category = "键盘操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"keys": "ctrl+shift+esc", "interval": 0.05}
@@ -641,6 +652,7 @@ class HotkeyNode(WorkflowNodeModel):
 class KeyDownNode(WorkflowNodeModel):
     type_name = "key_down"
     display_name = "按键按下"
+    category = "键盘操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"key": "shift"}
@@ -662,6 +674,7 @@ class KeyDownNode(WorkflowNodeModel):
 class KeyUpNode(WorkflowNodeModel):
     type_name = "key_up"
     display_name = "按键抬起"
+    category = "键盘操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"key": "shift"}
@@ -683,6 +696,7 @@ class KeyUpNode(WorkflowNodeModel):
 class DelayNode(WorkflowNodeModel):
     type_name = "delay"
     display_name = "延迟等待"
+    category = "流程控制"
 
     def default_config(self) -> Dict[str, Any]:
         return {"seconds": 1.0}
@@ -713,6 +727,7 @@ class DelayNode(WorkflowNodeModel):
 class ImageLocateNode(WorkflowNodeModel):
     type_name = "image_locate"
     display_name = "图像定位"
+    category = "图像识别"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -840,6 +855,7 @@ class ImageLocateNode(WorkflowNodeModel):
 class WaitForImageNode(ImageLocateNode):
     type_name = "wait_for_image"
     display_name = "等待图像出现"
+    category = "图像识别"
 
     def default_config(self) -> Dict[str, Any]:
         base = super().default_config()
@@ -909,6 +925,7 @@ class WaitForImageNode(ImageLocateNode):
 class PixelColorNode(WorkflowNodeModel):
     type_name = "pixel_color"
     display_name = "读取像素颜色"
+    category = "图像识别"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -987,6 +1004,7 @@ class PixelColorNode(WorkflowNodeModel):
 class MoveMouseToResultNode(WorkflowNodeModel):
     type_name = "move_to_result"
     display_name = "移动到结果坐标"
+    category = "鼠标操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {"source_node": "", "duration": 0.2}
@@ -1030,6 +1048,7 @@ class MoveMouseToResultNode(WorkflowNodeModel):
 class FileCopyNode(WorkflowNodeModel):
     type_name = "file_copy"
     display_name = "复制文件/目录"
+    category = "系统操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -1132,6 +1151,7 @@ class FileCopyNode(WorkflowNodeModel):
 class FileMoveNode(WorkflowNodeModel):
     type_name = "file_move"
     display_name = "移动文件/目录"
+    category = "系统操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -1230,6 +1250,7 @@ class FileMoveNode(WorkflowNodeModel):
 class FileDeleteNode(WorkflowNodeModel):
     type_name = "file_delete"
     display_name = "删除文件/目录"
+    category = "系统操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {
@@ -1284,6 +1305,7 @@ class FileDeleteNode(WorkflowNodeModel):
 class CommandNode(WorkflowNodeModel):
     type_name = "command"
     display_name = "执行命令"
+    category = "系统操作"
 
     def default_config(self) -> Dict[str, Any]:
         return {

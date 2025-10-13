@@ -10,12 +10,13 @@ import math
 import sys
 import time
 import uuid
+from collections import defaultdict
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
 from automation_runtime import PyAutoGuiRuntime, get_system_dpi_scale
-from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect, QSizeF
+from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect, QSizeF, QSize
 from PySide6.QtGui import (
 	QColor,
 	QDrag,
@@ -144,6 +145,7 @@ from workflow_core import (
 	WorkflowGraph,
 	create_node,
 	iter_registry,
+	WorkflowNodeModel,
 )
 
 
@@ -196,6 +198,17 @@ def show_warning(parent: QWidget, title: str, message: str) -> None:
 class NodePalette(QListWidget):
 	"""Left-hand palette that enumerates available node types."""
 
+	HEADER_ROLE = Qt.ItemDataRole.UserRole + 1
+	CATEGORY_NAME_ROLE = Qt.ItemDataRole.UserRole + 2
+	CATEGORY_ORDER = (
+		"鼠标操作",
+		"键盘操作",
+		"图像识别",
+		"流程控制",
+		"系统操作",
+		"其他",
+	)
+
 	def __init__(self, parent: Optional[QWidget] = None) -> None:
 		super().__init__(parent)
 		self.setObjectName("nodePalette")
@@ -206,15 +219,84 @@ class NodePalette(QListWidget):
 		self.setFrameShape(QFrame.Shape.NoFrame)
 		self.setSpacing(4)
 		self.setUniformItemSizes(True)
+		self._category_headers: Dict[str, QListWidgetItem] = {}
+		self._category_nodes: Dict[str, List[QListWidgetItem]] = {}
+		self._category_collapsed: Dict[str, bool] = {}
 		self._apply_palette_style()
 		self.populate()
 
 	def populate(self) -> None:
 		self.clear()
-		for node in sorted(iter_registry(), key=lambda item: item.display_name.lower()):
-			item = QListWidgetItem(node.display_name)
-			item.setData(Qt.ItemDataRole.UserRole, node.type_name)
-			self.addItem(item)
+		self._category_headers.clear()
+		self._category_nodes.clear()
+		self._category_collapsed.clear()
+		nodes_by_category: Dict[str, List[WorkflowNodeModel]] = defaultdict(list)
+		for node in iter_registry():
+			category = getattr(node, "category", "其他") or "其他"
+			nodes_by_category[category].append(node)
+		if not nodes_by_category:
+			return
+		ordered_categories = [cat for cat in self.CATEGORY_ORDER if cat in nodes_by_category]
+		remaining = sorted(cat for cat in nodes_by_category if cat not in self.CATEGORY_ORDER)
+		for category in ordered_categories + remaining:
+			nodes = sorted(nodes_by_category[category], key=lambda item: item.display_name.lower())
+			if not nodes:
+				continue
+			header = self._add_category_header(category)
+			self._category_headers[category] = header
+			self._category_nodes[category] = []
+			for node in nodes:
+				item = QListWidgetItem(f"    {node.display_name}")
+				item.setData(Qt.ItemDataRole.UserRole, node.type_name)
+				item.setData(self.HEADER_ROLE, False)
+				item.setData(self.CATEGORY_NAME_ROLE, category)
+				self.addItem(item)
+				self._category_nodes[category].append(item)
+			self._set_category_collapsed(category, True, force=True)
+
+	def _add_category_header(self, category: str) -> QListWidgetItem:
+		header = QListWidgetItem(category)
+		header.setFlags(Qt.ItemFlag.ItemIsEnabled)
+		header_font = QFont(self.font())
+		header_font.setBold(True)
+		header.setFont(header_font)
+		header.setData(Qt.ItemDataRole.UserRole, None)
+		header.setData(self.HEADER_ROLE, True)
+		header.setData(self.CATEGORY_NAME_ROLE, category)
+		header.setForeground(QColor(210, 210, 210))
+		header.setData(Qt.ItemDataRole.BackgroundRole, QColor(45, 45, 45))
+		header.setData(Qt.ItemDataRole.SizeHintRole, QSize(header.sizeHint().width(), header.sizeHint().height() + 6))
+		self.addItem(header)
+		return header
+
+	def _set_category_collapsed(self, category: str, collapsed: bool, *, force: bool = False) -> None:
+		if not force and self._category_collapsed.get(category) == collapsed:
+			return
+		header = self._category_headers.get(category)
+		if header is not None:
+			indicator = "▶" if collapsed else "▼"
+			header.setText(f"{indicator} {category}")
+		self._category_collapsed[category] = collapsed
+		items = self._category_nodes.get(category, [])
+		if collapsed:
+			if self.currentItem() in items:
+				self.clearSelection()
+		for item in items:
+			item.setHidden(collapsed)
+
+	def _toggle_category(self, category: str) -> None:
+		current = self._category_collapsed.get(category, True)
+		self._set_category_collapsed(category, not current)
+
+	def mousePressEvent(self, event):  # noqa: D401
+		item = self.itemAt(event.pos())
+		if item is not None and item.data(self.HEADER_ROLE):
+			category = item.data(self.CATEGORY_NAME_ROLE)
+			if category:
+				self._toggle_category(str(category))
+			event.accept()
+			return
+		super().mousePressEvent(event)
 
 	def _apply_palette_style(self) -> None:
 		self.setStyleSheet(
@@ -242,7 +324,7 @@ class NodePalette(QListWidget):
 
 	def startDrag(self, supported_actions: Qt.DropAction) -> None:  # noqa: N802
 		item = self.currentItem()
-		if item is None:
+		if item is None or item.data(self.HEADER_ROLE):
 			return
 		node_type = item.data(Qt.ItemDataRole.UserRole)
 		if not node_type:
