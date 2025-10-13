@@ -53,7 +53,7 @@ def main() -> None:
 			setTheme(Theme.AUTO)
 		setThemeColor(QColor(0, 120, 212), save=False)
 	window = MainWindow()
-	window.show()
+	window.showMaximized()
 	sys.exit(app.exec())
 
 
