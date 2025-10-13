@@ -1220,6 +1220,60 @@ class FileMoveNode(WorkflowNodeModel):
         return destination
 
 
+class FileDeleteNode(WorkflowNodeModel):
+    type_name = "file_delete"
+    display_name = "删除文件/目录"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "target_path": "",
+            "missing": "忽略",
+        }
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        target = cfg.get("target_path")
+        if not isinstance(target, str):
+            raise ValueError("target_path 必须是字符串")
+        missing = cfg.get("missing", "忽略")
+        if missing not in {"忽略", "报错"}:
+            raise ValueError("missing 必须为 忽略 或 报错")
+        cfg["target_path"] = target.strip()
+        cfg["missing"] = missing
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "target_path", "label": "目标路径", "type": "str"},
+            {
+                "key": "missing",
+                "label": "缺失时",
+                "type": "choices",
+                "choices": [("忽略", "忽略"), ("报错", "报错")],
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> str:  # noqa: ARG002
+        cfg = self.config
+        target_value = cfg.get("target_path", "")
+        if not target_value:
+            raise ExecutionError("目标路径未设置")
+        target = Path(target_value).expanduser()
+        if not target.exists():
+            if cfg.get("missing", "忽略") == "报错":
+                raise ExecutionError("目标不存在")
+            context.record(self.id, "not-found")
+            return "not-found"
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError as exc:
+            raise ExecutionError(f"删除失败: {exc}") from exc
+        context.record(self.id, "deleted")
+        return "deleted"
+
+
 NODE_REGISTRY = {
     ScreenshotNode.type_name: ScreenshotNode,
     MouseClickNode.type_name: MouseClickNode,
@@ -1240,6 +1294,7 @@ NODE_REGISTRY = {
     MoveMouseToResultNode.type_name: MoveMouseToResultNode,
     FileCopyNode.type_name: FileCopyNode,
     FileMoveNode.type_name: FileMoveNode,
+    FileDeleteNode.type_name: FileDeleteNode,
 }
 
 
