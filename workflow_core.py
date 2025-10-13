@@ -186,7 +186,8 @@ class ScreenshotNode(WorkflowNodeModel):
             {
                 "key": "output_dir",
                 "label": "输出目录",
-                "type": "str",
+                "type": "directory",
+                "dialog_title": "选择输出目录",
             },
             {
                 "key": "filename",
@@ -801,7 +802,13 @@ class ImageLocateNode(WorkflowNodeModel):
 
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "image_path", "label": "图像路径", "type": "str"},
+            {
+                "key": "image_path",
+                "label": "图像路径",
+                "type": "file_open",
+                "dialog_title": "选择图像文件",
+                "name_filter": "Image Files (*.png *.jpg *.jpeg *.bmp *.gif);;All Files (*.*)",
+            },
             {
                 "key": "confidence",
                 "label": "匹配度",
@@ -859,7 +866,15 @@ class WaitForImageNode(ImageLocateNode):
 
     def default_config(self) -> Dict[str, Any]:
         base = super().default_config()
-        base.update({"timeout": 10.0, "poll_interval": 0.5})
+        base.update(
+            {
+                "expect_r": 0,
+                "expect_g": 0,
+                "expect_b": 0,
+                "timeout": 10.0,
+                "poll_interval": 0.5,
+            }
+        )
         return base
 
     def validate_config(self) -> None:
@@ -920,6 +935,101 @@ class WaitForImageNode(ImageLocateNode):
             if time.monotonic() >= deadline:
                 raise ExecutionError("等待图像超时")
             time.sleep(float(cfg["poll_interval"]))
+
+
+class ClickImageNode(ImageLocateNode):
+    type_name = "click_image"
+    display_name = "图像点击"
+    category = "图像识别"
+
+    def default_config(self) -> Dict[str, Any]:
+        base = super().default_config()
+        base.update(
+            {
+                "offset_x": 0,
+                "offset_y": 0,
+                "click_button": "left",
+                "clicks": 1,
+                "interval": 0.1,
+            }
+        )
+        return base
+
+    def validate_config(self) -> None:
+        super().validate_config()
+        cfg = self.config
+        for key in ("offset_x", "offset_y"):
+            value = cfg.get(key)
+            if not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer")
+        if cfg.get("click_button") not in {"left", "right", "middle"}:
+            raise ValueError("click_button must be left/right/middle")
+        clicks = cfg.get("clicks")
+        if not isinstance(clicks, int) or clicks <= 0:
+            raise ValueError("clicks must be a positive integer")
+        interval = cfg.get("interval")
+        if not isinstance(interval, (int, float)) or interval < 0:
+            raise ValueError("interval must be non-negative")
+        cfg["interval"] = float(interval)
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        base = list(super().config_schema())
+        base.extend(
+            [
+                {
+                    "key": "offset_x",
+                    "label": "点击偏移X",
+                    "type": "int",
+                    "min": -10000,
+                    "max": 10000,
+                },
+                {
+                    "key": "offset_y",
+                    "label": "点击偏移Y",
+                    "type": "int",
+                    "min": -10000,
+                    "max": 10000,
+                },
+                {
+                    "key": "click_button",
+                    "label": "按键",
+                    "type": "choices",
+                    "choices": [("left", "左键"), ("right", "右键"), ("middle", "中键")],
+                },
+                {
+                    "key": "clicks",
+                    "label": "点击次数",
+                    "type": "int",
+                    "min": 1,
+                    "max": 10,
+                },
+                {
+                    "key": "interval",
+                    "label": "点击间隔",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 5.0,
+                    "step": 0.05,
+                },
+            ]
+        )
+        return base
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, int]:
+        location = super().execute(context, runtime)
+        cfg = self.config
+        click_x = int(location["x"]) + int(cfg["offset_x"])
+        click_y = int(location["y"]) + int(cfg["offset_y"])
+        runtime.mouse_click(
+            click_x,
+            click_y,
+            cfg["click_button"],
+            int(cfg["clicks"]),
+            float(cfg["interval"]),
+        )
+        result = {"x": click_x, "y": click_y}
+        context.record(self.id, result)
+        return result
 
 
 class PixelColorNode(WorkflowNodeModel):
@@ -1001,6 +1111,89 @@ class PixelColorNode(WorkflowNodeModel):
         return result
 
 
+class WaitForPixelColorNode(PixelColorNode):
+    type_name = "wait_for_pixel"
+    display_name = "等待像素颜色"
+    category = "图像识别"
+
+    def default_config(self) -> Dict[str, Any]:
+        base = super().default_config()
+        base.update(
+            {
+                "expect_r": 0,
+                "expect_g": 0,
+                "expect_b": 0,
+                "timeout": 10.0,
+                "poll_interval": 0.5,
+            }
+        )
+        return base
+
+    def validate_config(self) -> None:
+        super().validate_config()
+        cfg = self.config
+        if any(cfg.get(channel) is None for channel in ("expect_r", "expect_g", "expect_b")):
+            raise ValueError("必须设置完整的期望RGB数值")
+        timeout = cfg.get("timeout")
+        poll = cfg.get("poll_interval")
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if not isinstance(poll, (int, float)) or poll <= 0:
+            raise ValueError("poll_interval must be positive")
+        if float(poll) > float(timeout):
+            raise ValueError("poll_interval must not exceed timeout")
+        cfg["timeout"] = float(timeout)
+        cfg["poll_interval"] = float(poll)
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        base = list(super().config_schema())
+        base.extend(
+            [
+                {
+                    "key": "timeout",
+                    "label": "超时时间(秒)",
+                    "type": "float",
+                    "min": 0.1,
+                    "max": 3600.0,
+                    "step": 0.1,
+                },
+                {
+                    "key": "poll_interval",
+                    "label": "轮询间隔(秒)",
+                    "type": "float",
+                    "min": 0.05,
+                    "max": 60.0,
+                    "step": 0.05,
+                },
+            ]
+        )
+        return base
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, int]:
+        cfg = self.config
+        target = (
+            int(cast(int, cfg["expect_r"])),
+            int(cast(int, cfg["expect_g"])),
+            int(cast(int, cfg["expect_b"])),
+        )
+        tolerance = int(cfg.get("tolerance", 0))
+        deadline = time.monotonic() + float(cfg["timeout"])
+        poll = float(cfg["poll_interval"])
+        while True:
+            r, g, b = runtime.get_pixel_color(cfg["x"], cfg["y"])
+            if (
+                abs(r - target[0]) <= tolerance
+                and abs(g - target[1]) <= tolerance
+                and abs(b - target[2]) <= tolerance
+            ):
+                result = {"r": r, "g": g, "b": b}
+                context.record(self.id, result)
+                return result
+            if time.monotonic() >= deadline:
+                raise ExecutionError("等待像素颜色超时")
+            time.sleep(poll)
+
+
 class MoveMouseToResultNode(WorkflowNodeModel):
     type_name = "move_to_result"
     display_name = "移动到结果坐标"
@@ -1079,8 +1272,20 @@ class FileCopyNode(WorkflowNodeModel):
 
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "source_path", "label": "源路径", "type": "str"},
-            {"key": "destination_path", "label": "目标路径", "type": "str"},
+            {
+                "key": "source_path",
+                "label": "源路径",
+                "type": "path",
+                "dialog_mode": "any",
+                "dialog_title": "选择源路径",
+            },
+            {
+                "key": "destination_path",
+                "label": "目标路径",
+                "type": "path",
+                "dialog_mode": "any",
+                "dialog_title": "选择目标路径",
+            },
             {
                 "key": "overwrite",
                 "label": "存在时",
@@ -1182,8 +1387,20 @@ class FileMoveNode(WorkflowNodeModel):
 
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "source_path", "label": "源路径", "type": "str"},
-            {"key": "destination_path", "label": "目标路径", "type": "str"},
+            {
+                "key": "source_path",
+                "label": "源路径",
+                "type": "path",
+                "dialog_mode": "any",
+                "dialog_title": "选择源路径",
+            },
+            {
+                "key": "destination_path",
+                "label": "目标路径",
+                "type": "path",
+                "dialog_mode": "any",
+                "dialog_title": "选择目标路径",
+            },
             {
                 "key": "overwrite",
                 "label": "存在时",
@@ -1271,7 +1488,13 @@ class FileDeleteNode(WorkflowNodeModel):
 
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "target_path", "label": "目标路径", "type": "str"},
+            {
+                "key": "target_path",
+                "label": "目标路径",
+                "type": "path",
+                "dialog_mode": "any",
+                "dialog_title": "选择目标路径",
+            },
             {
                 "key": "missing",
                 "label": "缺失时",
@@ -1341,7 +1564,12 @@ class CommandNode(WorkflowNodeModel):
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
             {"key": "command", "label": "命令", "type": "str"},
-            {"key": "working_dir", "label": "工作目录(可空)", "type": "str"},
+            {
+                "key": "working_dir",
+                "label": "工作目录(可空)",
+                "type": "directory",
+                "dialog_title": "选择工作目录",
+            },
             {
                 "key": "timeout",
                 "label": "超时(秒)",
@@ -1396,7 +1624,9 @@ NODE_REGISTRY = {
     DelayNode.type_name: DelayNode,
     ImageLocateNode.type_name: ImageLocateNode,
     WaitForImageNode.type_name: WaitForImageNode,
+    ClickImageNode.type_name: ClickImageNode,
     PixelColorNode.type_name: PixelColorNode,
+    WaitForPixelColorNode.type_name: WaitForPixelColorNode,
     MoveMouseToResultNode.type_name: MoveMouseToResultNode,
     FileCopyNode.type_name: FileCopyNode,
     FileMoveNode.type_name: FileMoveNode,

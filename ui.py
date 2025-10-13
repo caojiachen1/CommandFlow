@@ -31,10 +31,12 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
 	QApplication,
+	QCheckBox,
 	QComboBox,
 	QDialog,
 	QDialogButtonBox,
 	QDoubleSpinBox,
+	QMenu,
 	QFileDialog,
 	QFormLayout,
 	QGraphicsView,
@@ -1194,6 +1196,88 @@ class WorkflowScene(QGraphicsScene):
 # -- Configuration dialog --------------------------------------------------
 
 
+class PathPicker(QWidget):
+	"""Composite widget that combines a line edit with a browse button."""
+
+	def __init__(
+		self,
+		parent: Optional[QWidget] = None,
+		*,
+		initial: str = "",
+		mode: str = "file_open",
+		dialog_title: str = "选择路径",
+		file_title: Optional[str] = None,
+		directory_title: Optional[str] = None,
+		save_title: Optional[str] = None,
+		name_filter: str = "All Files (*.*)",
+		placeholder: str = "",
+		start_directory: str = "",
+	) -> None:
+		super().__init__(parent)
+		self._mode = mode
+		self._dialog_title = dialog_title or "选择路径"
+		self._file_title = file_title or self._dialog_title
+		self._directory_title = directory_title or self._dialog_title
+		self._save_title = save_title or self._file_title
+		self._name_filter = name_filter or "All Files (*.*)"
+		self._start_directory = start_directory
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(6)
+		line_cls = FluentLineEdit if HAVE_FLUENT_WIDGETS else QLineEdit
+		self._line_edit = line_cls(self)
+		if placeholder:
+			self._line_edit.setPlaceholderText(placeholder)
+		self._line_edit.setText(initial or "")
+		layout.addWidget(self._line_edit, 1)
+		self._button = QPushButton("浏览...", self)
+		self._button.setCursor(Qt.CursorShape.PointingHandCursor)
+		if mode == "any":
+			menu = QMenu(self)
+			file_action = menu.addAction("选择文件")
+			file_action.triggered.connect(lambda: self._choose("file_open"))
+			dir_action = menu.addAction("选择文件夹")
+			dir_action.triggered.connect(lambda: self._choose("directory"))
+			self._button.setMenu(menu)
+		else:
+			self._button.clicked.connect(lambda: self._choose(self._mode))
+		layout.addWidget(self._button)
+
+	def text(self) -> str:
+		return self._line_edit.text()
+
+	def setText(self, value: str) -> None:
+		self._line_edit.setText(value or "")
+
+	def value(self) -> str:
+		return self.text().strip()
+
+	def _initial_directory(self) -> str:
+		current = self._line_edit.text().strip()
+		if current:
+			candidate = Path(current).expanduser()
+			if candidate.is_dir():
+				return str(candidate)
+			if candidate.parent.exists():
+				return str(candidate.parent)
+		if self._start_directory:
+			return self._start_directory
+		return str(Path.home())
+
+	def _choose(self, mode: str) -> None:
+		start_dir = self._initial_directory()
+		selected = ""
+		if mode == "directory":
+			selected = QFileDialog.getExistingDirectory(self, self._directory_title, start_dir)
+		elif mode == "file_save":
+			selected, _ = QFileDialog.getSaveFileName(self, self._save_title, start_dir, self._name_filter)
+		else:
+			title = self._file_title
+			selected, _ = QFileDialog.getOpenFileName(self, title, start_dir, self._name_filter)
+		if selected:
+			self._line_edit.setText(selected)
+
+
 class ConfigDialog(ConfigDialogBase):
 	"""Generic configuration dialog built from a node schema."""
 
@@ -1245,6 +1329,25 @@ class ConfigDialog(ConfigDialogBase):
 		key = cast(str, field["key"])
 		value = values.get(key)
 		ftype = cast(str, field.get("type", "str"))
+		if ftype in {"path", "file_open", "file_save", "directory"}:
+			mode = ftype if ftype != "path" else cast(str, field.get("dialog_mode", "file_open"))
+			picker = PathPicker(
+				self,
+				initial=str(value or ""),
+				mode=mode,
+				dialog_title=cast(str, field.get("dialog_title", "选择路径")),
+				file_title=cast(Optional[str], field.get("file_dialog_title")),
+				directory_title=cast(Optional[str], field.get("directory_dialog_title")),
+				save_title=cast(Optional[str], field.get("save_dialog_title")),
+				name_filter=cast(str, field.get("name_filter", "All Files (*.*)")),
+				placeholder=cast(str, field.get("placeholder", "")),
+				start_directory=cast(str, field.get("start_directory", "")),
+			)
+			return picker
+		if ftype == "bool":
+			widget = QCheckBox(self)
+			widget.setChecked(bool(value))
+			return widget
 		if ftype == "int":
 			widget_cls = FluentSpinBox if HAVE_FLUENT_WIDGETS else QSpinBox
 			widget = widget_cls(self)
@@ -1290,7 +1393,11 @@ class ConfigDialog(ConfigDialogBase):
 	def values(self) -> Dict[str, object]:
 		result: Dict[str, object] = {}
 		for key, widget in self.widgets.items():
-			if isinstance(widget, QSpinBox):
+			if isinstance(widget, QCheckBox):
+				result[key] = widget.isChecked()
+			elif isinstance(widget, PathPicker):
+				result[key] = widget.value()
+			elif isinstance(widget, QSpinBox):
 				result[key] = widget.value()
 			elif isinstance(widget, QDoubleSpinBox):
 				result[key] = widget.value()
