@@ -1020,6 +1020,206 @@ class MoveMouseToResultNode(WorkflowNodeModel):
         return None
 
 
+class FileCopyNode(WorkflowNodeModel):
+    type_name = "file_copy"
+    display_name = "复制文件/目录"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "source_path": "",
+            "destination_path": "",
+            "overwrite": "覆盖",
+            "make_parents": "是",
+        }
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        source = cfg.get("source_path")
+        destination = cfg.get("destination_path")
+        if not isinstance(source, str):
+            raise ValueError("source_path 必须是字符串")
+        if not isinstance(destination, str):
+            raise ValueError("destination_path 必须是字符串")
+        overwrite = cfg.get("overwrite", "覆盖")
+        if overwrite not in {"覆盖", "跳过"}:
+            raise ValueError("overwrite 必须为 覆盖 或 跳过")
+        make_parents = cfg.get("make_parents", "是")
+        if make_parents not in {"是", "否"}:
+            raise ValueError("make_parents 必须为 是 或 否")
+        cfg["source_path"] = source.strip()
+        cfg["destination_path"] = destination.strip()
+        cfg["overwrite"] = overwrite
+        cfg["make_parents"] = make_parents
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "source_path", "label": "源路径", "type": "str"},
+            {"key": "destination_path", "label": "目标路径", "type": "str"},
+            {
+                "key": "overwrite",
+                "label": "存在时",
+                "type": "choices",
+                "choices": [("覆盖", "覆盖"), ("跳过", "跳过")],
+            },
+            {
+                "key": "make_parents",
+                "label": "创建父目录",
+                "type": "choices",
+                "choices": [("是", "是"), ("否", "否")],
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> str:  # noqa: ARG002
+        cfg = self.config
+        source_value = cfg["source_path"]
+        dest_value = cfg["destination_path"]
+        if not source_value:
+            raise ExecutionError("源路径未设置")
+        if not dest_value:
+            raise ExecutionError("目标路径未设置")
+        source = Path(source_value).expanduser()
+        if not source.exists():
+            raise ExecutionError("源路径不存在")
+        destination = Path(dest_value).expanduser()
+        overwrite = cfg.get("overwrite", "覆盖") == "覆盖"
+        make_parents = cfg.get("make_parents", "是") == "是"
+
+        final_target = self._determine_target_path(source, destination)
+        if final_target.exists():
+            if source.is_dir() and final_target.is_file():
+                raise ExecutionError("目标路径是文件，无法覆盖目录")
+            if not overwrite:
+                context.record(self.id, str(final_target.resolve()))
+                return str(final_target.resolve())
+            if final_target.resolve() == source.resolve():
+                context.record(self.id, str(final_target.resolve()))
+                return str(final_target.resolve())
+            if final_target.is_dir():
+                shutil.rmtree(final_target)
+            else:
+                final_target.unlink()
+
+        parent = final_target.parent
+        if not parent.exists():
+            if make_parents:
+                parent.mkdir(parents=True, exist_ok=True)
+            else:
+                raise ExecutionError("目标父目录不存在")
+
+        if source.is_dir():
+            shutil.copytree(source, final_target)
+        else:
+            shutil.copy2(source, final_target)
+
+        result = str(final_target.resolve()) if final_target.exists() else str(final_target)
+        context.record(self.id, result)
+        return result
+
+    @staticmethod
+    def _determine_target_path(source: Path, destination: Path) -> Path:
+        if destination.exists() and destination.is_dir():
+            return destination / source.name
+        return destination
+
+
+class FileMoveNode(WorkflowNodeModel):
+    type_name = "file_move"
+    display_name = "移动文件/目录"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "source_path": "",
+            "destination_path": "",
+            "overwrite": "覆盖",
+            "make_parents": "是",
+        }
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        source = cfg.get("source_path")
+        destination = cfg.get("destination_path")
+        if not isinstance(source, str):
+            raise ValueError("source_path 必须是字符串")
+        if not isinstance(destination, str):
+            raise ValueError("destination_path 必须是字符串")
+        overwrite = cfg.get("overwrite", "覆盖")
+        if overwrite not in {"覆盖", "跳过"}:
+            raise ValueError("overwrite 必须为 覆盖 或 跳过")
+        make_parents = cfg.get("make_parents", "是")
+        if make_parents not in {"是", "否"}:
+            raise ValueError("make_parents 必须为 是 或 否")
+        cfg["source_path"] = source.strip()
+        cfg["destination_path"] = destination.strip()
+        cfg["overwrite"] = overwrite
+        cfg["make_parents"] = make_parents
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {"key": "source_path", "label": "源路径", "type": "str"},
+            {"key": "destination_path", "label": "目标路径", "type": "str"},
+            {
+                "key": "overwrite",
+                "label": "存在时",
+                "type": "choices",
+                "choices": [("覆盖", "覆盖"), ("跳过", "跳过")],
+            },
+            {
+                "key": "make_parents",
+                "label": "创建父目录",
+                "type": "choices",
+                "choices": [("是", "是"), ("否", "否")],
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> str:  # noqa: ARG002
+        cfg = self.config
+        source_value = cfg["source_path"]
+        dest_value = cfg["destination_path"]
+        if not source_value:
+            raise ExecutionError("源路径未设置")
+        if not dest_value:
+            raise ExecutionError("目标路径未设置")
+        source = Path(source_value).expanduser()
+        if not source.exists():
+            raise ExecutionError("源路径不存在")
+        destination = Path(dest_value).expanduser()
+        overwrite = cfg.get("overwrite", "覆盖") == "覆盖"
+        make_parents = cfg.get("make_parents", "是") == "是"
+
+        final_target = self._determine_target_path(source, destination)
+
+        if final_target.exists():
+            if final_target.resolve() == source.resolve():
+                context.record(self.id, str(final_target.resolve()))
+                return str(final_target.resolve())
+            if not overwrite:
+                context.record(self.id, str(final_target.resolve()))
+                return str(final_target.resolve())
+            if final_target.is_dir():
+                shutil.rmtree(final_target)
+            else:
+                final_target.unlink()
+
+        parent = final_target.parent
+        if not parent.exists():
+            if make_parents:
+                parent.mkdir(parents=True, exist_ok=True)
+            else:
+                raise ExecutionError("目标父目录不存在")
+
+        shutil.move(str(source), str(final_target))
+
+        result = str(final_target.resolve()) if final_target.exists() else str(final_target)
+        context.record(self.id, result)
+        return result
+
+    @staticmethod
+    def _determine_target_path(source: Path, destination: Path) -> Path:
+        if destination.exists() and destination.is_dir():
+            return destination / source.name
+        return destination
+
+
 NODE_REGISTRY = {
     ScreenshotNode.type_name: ScreenshotNode,
     MouseClickNode.type_name: MouseClickNode,
@@ -1038,6 +1238,8 @@ NODE_REGISTRY = {
     WaitForImageNode.type_name: WaitForImageNode,
     PixelColorNode.type_name: PixelColorNode,
     MoveMouseToResultNode.type_name: MoveMouseToResultNode,
+    FileCopyNode.type_name: FileCopyNode,
+    FileMoveNode.type_name: FileMoveNode,
 }
 
 

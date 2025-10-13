@@ -19,7 +19,6 @@ set EXITCODE=%errorlevel%
 if not %EXITCODE%==0 (
     echo.
     echo [WARNING] script exited with code %EXITCODE%.
-    pause
     exit /b %EXITCODE%
 )
 
