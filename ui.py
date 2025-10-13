@@ -271,7 +271,7 @@ class WorkflowView(QGraphicsView):
 		self._pan_start = QPoint()
 		self._pan_scroll_start = QPoint()
 		self._zoom = 1.0
-		self._min_zoom = 0.2
+		self._min_zoom = 0.05
 		self._max_zoom = 3.0
 		self._zoom_step = 1.15
 
@@ -369,6 +369,27 @@ class WorkflowView(QGraphicsView):
 		self._zoom = new_zoom
 		self.zoomChanged.emit(self._zoom)
 		return True
+
+	def zoom_in(self) -> bool:
+		return self._apply_zoom(self._zoom_step)
+
+	def zoom_out(self) -> bool:
+		return self._apply_zoom(1.0 / self._zoom_step)
+
+	def reset_zoom(self) -> None:
+		self.resetTransform()
+		self._zoom = 1.0
+		self.zoomChanged.emit(self._zoom)
+
+	def fit_to_rect(self, rect: QRectF, padding: float = 40.0) -> None:
+		if rect.isNull() or rect.width() <= 0 or rect.height() <= 0:
+			self.reset_zoom()
+			return
+		padded = rect.adjusted(-padding, -padding, padding, padding)
+		self.resetTransform()
+		self.fitInView(padded, Qt.AspectRatioMode.KeepAspectRatio)
+		self._zoom = self.transform().m11()
+		self.zoomChanged.emit(self._zoom)
 
 	def _begin_panning(self, event) -> bool:
 		if event.button() in (
@@ -1172,8 +1193,33 @@ class WorkflowInterface(QWidget):
 		self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.run_button.setMinimumHeight(40)
 		right_layout.addWidget(self.run_button)
+		zoom_controls = QHBoxLayout()
+		zoom_controls.setContentsMargins(0, 0, 0, 0)
+		zoom_controls.setSpacing(8)
+		# Provide quick zoom operations alongside the primary run control.
+		self.zoom_out_button = self._make_side_button("缩小", right_panel)
+		self.zoom_out_button.clicked.connect(self.handle_zoom_out)
+		zoom_controls.addWidget(self.zoom_out_button)
+		self.zoom_reset_button = self._make_side_button("重置", right_panel)
+		self.zoom_reset_button.clicked.connect(self.handle_zoom_reset)
+		zoom_controls.addWidget(self.zoom_reset_button)
+		self.zoom_in_button = self._make_side_button("放大", right_panel)
+		self.zoom_in_button.clicked.connect(self.handle_zoom_in)
+		zoom_controls.addWidget(self.zoom_in_button)
+		self.zoom_fit_button = self._make_side_button("适配", right_panel)
+		self.zoom_fit_button.clicked.connect(self.fit_workflow_to_nodes)
+		zoom_controls.addWidget(self.zoom_fit_button)
+		right_layout.addLayout(zoom_controls)
 		log_label = BodyLabel("日志", right_panel) if HAVE_FLUENT_WIDGETS else QLabel("日志", right_panel)
-		right_layout.addWidget(log_label)
+		log_header = QHBoxLayout()
+		log_header.setContentsMargins(0, 0, 0, 0)
+		log_header.setSpacing(8)
+		log_header.addWidget(log_label)
+		log_header.addStretch(1)
+		self.clear_log_button = self._make_side_button("清空日志", right_panel)
+		self.clear_log_button.clicked.connect(self.clear_log)
+		log_header.addWidget(self.clear_log_button)
+		right_layout.addLayout(log_header)
 		right_layout.addWidget(self.log_widget, 1)
 
 		splitter = QSplitter(self)
@@ -1206,6 +1252,43 @@ class WorkflowInterface(QWidget):
 		)
 		self.runner.started.connect(lambda: self.append_log("开始执行工作流"))
 		self.runner.finished.connect(self.on_execution_finished)
+
+	def _make_side_button(self, text: str, parent: QWidget) -> QPushButton:
+		button = QPushButton(text, parent)
+		button.setObjectName("workflowSideButton")
+		button.setCursor(Qt.CursorShape.PointingHandCursor)
+		button.setMinimumHeight(32)
+		button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+		return button
+
+	def handle_zoom_in(self) -> None:
+		if not self.view.zoom_in():
+			self.show_status("已达到最大缩放", 2000)
+
+	def handle_zoom_out(self) -> None:
+		if not self.view.zoom_out():
+			self.show_status("已达到最小缩放", 2000)
+
+	def handle_zoom_reset(self) -> None:
+		self.view.reset_zoom()
+		self.show_status("缩放已重置", 2000)
+
+	def fit_workflow_to_nodes(self) -> None:
+		if not self.scene.node_items:
+			self.view.reset_zoom()
+			self.show_status("没有可适配的节点，已重置缩放", 2000)
+			return
+		bounds = self.scene.itemsBoundingRect()
+		if bounds.isNull() or bounds.width() <= 0 or bounds.height() <= 0:
+			self.view.reset_zoom()
+			self.show_status("视图已重置", 2000)
+			return
+		self.view.fit_to_rect(bounds)
+		self.show_status("视图已适配当前工作流", 2000)
+
+	def clear_log(self) -> None:
+		self.log_widget.clear()
+		self.show_status("日志已清空", 2000)
 
 	def append_log(self, message: str) -> None:
 		timestamp = time.strftime("%H:%M:%S")
@@ -1297,6 +1380,20 @@ class WorkflowInterface(QWidget):
 		}
 		QSplitter::handle:hover {
 			background: rgba(255, 255, 255, 35);
+		}
+		QPushButton#workflowSideButton {
+			background: rgba(255, 255, 255, 18);
+			border: 1px solid rgba(255, 255, 255, 28);
+			border-radius: 8px;
+			padding: 6px 12px;
+			color: #ffffff;
+			font-weight: 500;
+		}
+		QPushButton#workflowSideButton:hover {
+			background: rgba(255, 255, 255, 28);
+		}
+		QPushButton#workflowSideButton:pressed {
+			background: rgba(255, 255, 255, 18);
 		}
 		"""
 		if not HAVE_FLUENT_WIDGETS:
