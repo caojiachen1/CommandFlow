@@ -1432,7 +1432,14 @@ class WorkflowInterface(QWidget):
 		self.show_status("日志已清空", 2000)
 
 	def set_base_window_title(self, title: str) -> None:
-		self._window_base_title = title or self._window_base_title
+		clean_title = (title or "").strip()
+		if clean_title.endswith(" *"):
+			clean_title = clean_title[:-2]
+		placeholder = " - 未命名"
+		if clean_title.endswith(placeholder):
+			clean_title = clean_title[: -len(placeholder)]
+		if clean_title:
+			self._window_base_title = clean_title
 		self.update_file_display()
 
 	def update_file_display(self) -> None:
