@@ -216,10 +216,10 @@ class NodePalette(QListWidget):
 		self.setStyleSheet(
 			"""
 			QListWidget#nodePalette {
-				background: transparent;
+				background: #1e1e1e;
 				border: none;
 				padding: 8px;
-				color: #f2f6ff;
+				color: #e6e6e6;
 			}
 			QListWidget#nodePalette::item {
 				padding: 8px 10px;
@@ -228,7 +228,7 @@ class NodePalette(QListWidget):
 			}
 			QListWidget#nodePalette::item:selected {
 				background: rgba(255, 255, 255, 40);
-				color: #ffffff;
+				color: #f2f2f2;
 			}
 			QListWidget#nodePalette::item:hover {
 				background: rgba(255, 255, 255, 20);
@@ -411,11 +411,11 @@ class NodePort(QGraphicsEllipseItem):
 		super().__init__(-6, -6, 12, 12, parent)
 		self._is_hovered = False
 		self._is_highlighted = False
-		self._default_color = QColor(96, 146, 222)
-		self._hover_color = QColor(122, 170, 240)
-		self._highlight_color = QColor(200, 220, 255)
+		self._default_color = QColor(90, 90, 90)
+		self._hover_color = QColor(130, 130, 130)
+		self._highlight_color = QColor(200, 200, 200)
 		self.setBrush(self._default_color)
-		pen = QPen(QColor(18, 26, 42), 1.4)
+		pen = QPen(QColor(45, 45, 45), 1.4)
 		pen.setCosmetic(True)
 		self.setPen(pen)
 		self.setFlag(
@@ -468,7 +468,7 @@ class ConnectionItem(QGraphicsPathItem):
 		super().__init__()
 		self.source = source
 		self.target = target
-		pen = QPen(QColor(86, 156, 214), 3)
+		pen = QPen(QColor(120, 120, 120), 3)
 		pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
 		pen.setCapStyle(Qt.PenCapStyle.RoundCap)
 		self.setPen(pen)
@@ -510,15 +510,15 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.setPen(Qt.PenStyle.NoPen)
 		self.setAcceptHoverEvents(True)
 		self._hovered = False
-		self._base_color = QColor(48, 75, 130)
-		self._accent_color = QColor(96, 173, 255)
+		self._base_color = QColor(53, 53, 53)
+		self._accent_color = QColor(90, 90, 90)
 		self._paint_margin = 8.0
 		self.title_item = QGraphicsTextItem(title, self)
 		title_font = QFont(self.title_item.font())
 		title_font.setPointSizeF(title_font.pointSizeF() + 1.5)
 		title_font.setBold(True)
 		self.title_item.setFont(title_font)
-		self.title_item.setDefaultTextColor(QColor(235, 240, 255))
+		self.title_item.setDefaultTextColor(QColor(220, 220, 220))
 		self.title_item.setPos(20, 14)
 		self.title_item.setZValue(1)
 		self.input_port = NodePort(self, "input")
@@ -527,7 +527,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 
 	def update_ports(self) -> None:
 		self.input_port.setPos(0, self.HEIGHT / 2 - 6)
-		self.output_port.setPos(self.WIDTH - 12, self.HEIGHT / 2 - 6)
+		self.output_port.setPos(self.WIDTH - 1, self.HEIGHT / 2 - 6)
 
 	def set_title(self, title: str) -> None:
 		self.title_item.setPlainText(title)
@@ -573,16 +573,12 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		inner_rect = self.rect().adjusted(1, 1, -1, -1)
 		body_path = QPainterPath()
 		body_path.addRoundedRect(inner_rect, 18, 18)
-		gradient = QLinearGradient(inner_rect.topLeft(), inner_rect.bottomLeft())
-		gradient.setColorAt(0.0, self._base_color.lighter(120))
-		gradient.setColorAt(0.45, self._base_color)
-		gradient.setColorAt(1.0, self._accent_color.darker(120))
-		painter.fillPath(body_path, gradient)
-		border_color = QColor(70, 95, 145)
+		painter.fillPath(body_path, self._base_color)
+		border_color = QColor(90, 90, 90)
 		if self._hovered:
-			border_color = QColor(110, 160, 240)
+			border_color = QColor(140, 140, 140)
 		if self.isSelected():
-			border_color = self._accent_color
+			border_color = QColor(210, 210, 210)
 		border_pen = QPen(border_color, 2.2)
 		border_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
 		painter.setPen(border_pen)
@@ -594,17 +590,14 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		clip_path = QPainterPath()
 		clip_path.addRoundedRect(inner_rect, 18, 18)
 		header_clip = clip_path.intersected(header_path)
-		header_gradient = QLinearGradient(header_rect.topLeft(), header_rect.bottomLeft())
-		header_gradient.setColorAt(0.0, self._accent_color.lighter(130))
-		header_gradient.setColorAt(1.0, self._accent_color.darker(110))
 		painter.save()
 		painter.setClipPath(header_clip)
-		painter.fillPath(header_path, header_gradient)
+		painter.fillPath(header_path, self._accent_color)
 		painter.restore()
 
-		glow_color = QColor(90, 140, 230, 90)
+		glow_color = QColor(140, 140, 140, 90)
 		if self.isSelected():
-			glow_color = QColor(120, 186, 255, 120)
+			glow_color = QColor(210, 210, 210, 130)
 		if self._hovered or self.isSelected():
 			glow_pen = QPen(glow_color, 6)
 			glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -641,13 +634,14 @@ class WorkflowScene(QGraphicsScene):
 		grid_step = 28
 		major_every = 4
 		rectf = QRectF(rect)
+		painter.fillRect(rectf, QColor(30, 30, 30))
 		left = int(math.floor(rectf.left() / grid_step) * grid_step)
 		right = int(math.ceil(rectf.right() / grid_step) * grid_step)
 		top = int(math.floor(rectf.top() / grid_step) * grid_step)
 		bottom = int(math.ceil(rectf.bottom() / grid_step) * grid_step)
-		minor_pen = QPen(QColor(70, 70, 70), 1)
+		minor_pen = QPen(QColor(60, 60, 60), 1)
 		minor_pen.setCosmetic(True)
-		major_pen = QPen(QColor(110, 110, 110), 1.4)
+		major_pen = QPen(QColor(90, 90, 90), 1.4)
 		major_pen.setCosmetic(True)
 		vertical_minor: List[QLineF] = []
 		vertical_major: List[QLineF] = []

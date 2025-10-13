@@ -25,4 +25,3 @@ if not %EXITCODE%==0 (
 
 echo.
 echo Application closed normally.
-pause
