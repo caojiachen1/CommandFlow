@@ -561,12 +561,16 @@ class WorkflowView(QGraphicsView):
 		self.setRenderHints(
 			self.renderHints() | QPainter.RenderHint.Antialiasing
 		)
-		self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+		self.setDragMode(QGraphicsView.DragMode.NoDrag)
 		self.setViewportUpdateMode(
 			QGraphicsView.ViewportUpdateMode.FullViewportUpdate
 		)
+		self.setCacheMode(QGraphicsView.CacheModeFlag.CacheNone)
+		self.setOptimizationFlags(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing)
 		self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 		self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+		self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+		self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 		self._panning = False
 		self._pan_start = QPoint()
 		self._pan_scroll_start = QPoint()
@@ -574,6 +578,8 @@ class WorkflowView(QGraphicsView):
 		self._min_zoom = 0.05
 		self._max_zoom = 3.0
 		self._zoom_step = 1.15
+		self._rubber_band_origin = QPoint()
+		self._is_rubber_banding = False
 
 	def dragEnterEvent(self, event):  # noqa: D401
 		if event.mimeData().hasFormat("application/x-workflow-node"):
@@ -612,6 +618,15 @@ class WorkflowView(QGraphicsView):
 	def mousePressEvent(self, event):  # noqa: D401
 		if self._begin_panning(event):
 			return
+		# Left button: Enable rubber band selection on empty space
+		if event.button() == Qt.MouseButton.LeftButton:
+			cursor_pos = event.position().toPoint()
+			item_under_cursor = self.itemAt(cursor_pos)
+			# Only enable rubber band if clicking on empty space
+			if item_under_cursor is None:
+				self._is_rubber_banding = True
+				self._rubber_band_origin = cursor_pos
+				self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
 		super().mousePressEvent(event)
 
 	def mouseMoveEvent(self, event):  # noqa: D401
@@ -629,6 +644,9 @@ class WorkflowView(QGraphicsView):
 			self._end_panning()
 			event.accept()
 			return
+		if self._is_rubber_banding:
+			self._is_rubber_banding = False
+			self.setDragMode(QGraphicsView.DragMode.NoDrag)
 		super().mouseReleaseEvent(event)
 
 	def resizeEvent(self, event):  # noqa: D401
@@ -692,32 +710,44 @@ class WorkflowView(QGraphicsView):
 		self.zoomChanged.emit(self._zoom)
 
 	def _begin_panning(self, event) -> bool:
-		if event.button() in (
-			Qt.MouseButton.MiddleButton,
-			Qt.MouseButton.RightButton,
-		) or (
-			event.button() == Qt.MouseButton.LeftButton
-			and event.modifiers() & Qt.KeyboardModifier.AltModifier
-		):
-			self._panning = True
-			self._pan_start = event.position().toPoint()
-			self._pan_scroll_start = QPoint(
-				self.horizontalScrollBar().value(),
-				self.verticalScrollBar().value(),
-			)
-			self.setCursor(Qt.CursorShape.ClosedHandCursor)
-			event.accept()
-			return True
-		return False
+		button = event.button()
+		modifiers = event.modifiers()
+		should_pan = False
+		# Right button and middle button always pan
+		if button in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+			should_pan = True
+		# Left button no longer pans by default
+		# (it's now used for selection/rubber band)
+		if not should_pan:
+			return False
+		self._panning = True
+		self._pan_start = event.position().toPoint()
+		self._pan_scroll_start = QPoint(
+			self.horizontalScrollBar().value(),
+			self.verticalScrollBar().value(),
+		)
+		self.setCursor(Qt.CursorShape.ClosedHandCursor)
+		event.accept()
+		return True
 
 	def _update_pan(self, event) -> None:
 		delta = event.position().toPoint() - self._pan_start
-		self.horizontalScrollBar().setValue(
-			self._pan_scroll_start.x() - delta.x()
-		)
-		self.verticalScrollBar().setValue(
-			self._pan_scroll_start.y() - delta.y()
-		)
+		new_h = self._pan_scroll_start.x() - delta.x()
+		new_v = self._pan_scroll_start.y() - delta.y()
+		
+		# Expand scene rect if approaching boundaries
+		scene_obj = self.scene()
+		if scene_obj is not None:
+			scene = cast(WorkflowScene, scene_obj)
+			viewport_rect = self.viewport().rect()
+			visible_scene_rect = self.mapToScene(viewport_rect).boundingRect()
+			scene._expand_scene_for_rect(visible_scene_rect)
+		
+		self.horizontalScrollBar().setValue(new_h)
+		self.verticalScrollBar().setValue(new_v)
+		
+		# Force immediate viewport update
+		self.viewport().update()
 		event.accept()
 
 	def _end_panning(self) -> None:
@@ -950,7 +980,7 @@ class WorkflowScene(QGraphicsScene):
 		self._z_counter = 0
 		self._scene_threshold = 220.0
 		self._scene_growth_step = 800.0
-		self._default_scene_rect = QRectF(-400, -300, 800, 600)
+		self._default_scene_rect = QRectF(-8000.0, -6000.0, 16000.0, 12000.0)
 		self.setSceneRect(self._default_scene_rect)
 
 	def drawBackground(self, painter: QPainter, rect: QRectF | QRect) -> None:  # noqa: D401
@@ -958,10 +988,18 @@ class WorkflowScene(QGraphicsScene):
 		major_every = 4
 		rectf = QRectF(rect)
 		painter.fillRect(rectf, QColor(30, 30, 30))
-		left = int(math.floor(rectf.left() / grid_step) * grid_step)
-		right = int(math.ceil(rectf.right() / grid_step) * grid_step)
-		top = int(math.floor(rectf.top() / grid_step) * grid_step)
-		bottom = int(math.ceil(rectf.bottom() / grid_step) * grid_step)
+		
+		# Draw grid that follows view panning smoothly
+		# Don't align to fixed scene coordinates - align relative to visible area
+		left = rectf.left()
+		right = rectf.right()
+		top = rectf.top()
+		bottom = rectf.bottom()
+		
+		# Calculate the first grid line positions
+		first_x = math.floor(left / grid_step) * grid_step
+		first_y = math.floor(top / grid_step) * grid_step
+		
 		minor_pen = QPen(QColor(60, 60, 60), 1)
 		minor_pen.setCosmetic(True)
 		major_pen = QPen(QColor(90, 90, 90), 1.4)
@@ -970,26 +1008,31 @@ class WorkflowScene(QGraphicsScene):
 		vertical_major: List[QLineF] = []
 		horizontal_minor: List[QLineF] = []
 		horizontal_major: List[QLineF] = []
-		x = left
-		index = 0
+		
+		# Draw vertical lines
+		x = first_x
 		while x <= right:
 			line = QLineF(x, top, x, bottom)
-			if index % major_every == 0:
+			# Determine if major line based on scene position
+			grid_index = int(round(x / grid_step))
+			if grid_index % major_every == 0:
 				vertical_major.append(line)
 			else:
 				vertical_minor.append(line)
 			x += grid_step
-			index += 1
-		y = top
-		index = 0
+		
+		# Draw horizontal lines
+		y = first_y
 		while y <= bottom:
 			line = QLineF(left, y, right, y)
-			if index % major_every == 0:
+			# Determine if major line based on scene position
+			grid_index = int(round(y / grid_step))
+			if grid_index % major_every == 0:
 				horizontal_major.append(line)
 			else:
 				horizontal_minor.append(line)
 			y += grid_step
-			index += 1
+		
 		if vertical_minor or horizontal_minor:
 			painter.setPen(minor_pen)
 			if vertical_minor:
@@ -1038,10 +1081,32 @@ class WorkflowScene(QGraphicsScene):
 		if width <= 0 or height <= 0:
 			return
 		self._update_scene_metrics(width, height)
-		default_rect = QRectF(-width / 2.0, -height / 2.0, width, height)
-		self._default_scene_rect = default_rect
-		if not self.node_items:
-			self.setSceneRect(default_rect)
+		min_span_x = max(width * 3.0, self._default_scene_rect.width())
+		min_span_y = max(height * 3.0, self._default_scene_rect.height())
+		need_expand_x = min_span_x > self._default_scene_rect.width()
+		need_expand_y = min_span_y > self._default_scene_rect.height()
+		if not (need_expand_x or need_expand_y):
+			return
+		target_width = max(min_span_x, self._default_scene_rect.width())
+		target_height = max(min_span_y, self._default_scene_rect.height())
+		width_delta = (target_width - self._default_scene_rect.width()) / 2.0
+		height_delta = (target_height - self._default_scene_rect.height()) / 2.0
+		self._default_scene_rect = self._default_scene_rect.adjusted(
+			-width_delta,
+			-height_delta,
+			width_delta,
+			height_delta,
+		)
+		if self.node_items:
+			self._recalculate_scene_rect()
+		else:
+			current_rect = self.sceneRect()
+			if current_rect.isNull():
+				current_rect = QRectF(self._default_scene_rect)
+			else:
+				current_rect = current_rect.united(self._default_scene_rect)
+			self.setSceneRect(current_rect)
+			self._update_scene_metrics(current_rect.width(), current_rect.height())
 
 	def _recalculate_scene_rect(self) -> None:
 		if not self.node_items:
