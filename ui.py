@@ -18,9 +18,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 from automation_runtime import PyAutoGuiRuntime, get_system_dpi_scale
 from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect, QSizeF, QSize
 from PySide6.QtGui import (
+	QAction,
 	QColor,
 	QDrag,
 	QIcon,
+	QKeySequence,
 	QLinearGradient,
 	QPainter,
 	QPainterPath,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
 	QMenu,
 	QFileDialog,
 	QFormLayout,
+	QKeySequenceEdit,
 	QGraphicsView,
 	QGraphicsEllipseItem,
 	QGraphicsItem,
@@ -62,6 +65,7 @@ from PySide6.QtWidgets import (
 	QAbstractItemView,
 	QStatusBar,
 	QFrame,
+	QTabWidget,
 )
 
 try:
@@ -149,6 +153,8 @@ from workflow_core import (
 	iter_registry,
 	WorkflowNodeModel,
 )
+
+from settings_manager import SettingsManager
 
 
 def configure_windows_dpi() -> None:
@@ -635,7 +641,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.update_ports()
 
 	def update_ports(self) -> None:
-		self.input_port.setPos(0, self.HEIGHT / 2 - 6)
+		self.input_port.setPos(1, self.HEIGHT / 2 - 6)
 		self.output_port.setPos(self.WIDTH - 1, self.HEIGHT / 2 - 6)
 
 	def set_title(self, title: str) -> None:
@@ -1450,14 +1456,150 @@ class WorkflowRunner(QObject):
 			self._running = False
 
 
+class SettingsDialog(ConfigDialogBase):
+	"""Global application settings dialog supporting shortcut editing."""
+
+	def __init__(self, settings: SettingsManager, parent: Optional[QWidget] = None) -> None:
+		super().__init__(parent)
+		self._settings = settings
+		self._shortcut_editors: Dict[str, QKeySequenceEdit] = {}
+		self._general_checkboxes: Dict[str, QCheckBox] = {}
+		if not HAVE_FLUENT_WIDGETS:
+			self.setWindowTitle("设置")
+			self.setModal(True)
+			self.setMinimumWidth(420)
+		self._build_layout()
+
+	def _build_layout(self) -> None:
+		if HAVE_FLUENT_WIDGETS:
+			fluent_self = cast(Any, self)
+			content_widget = QWidget(self)
+			content_layout = QVBoxLayout(content_widget)
+			content_layout.setContentsMargins(16, 0, 16, 0)
+			content_layout.setSpacing(12)
+			if hasattr(fluent_self, "viewLayout"):
+				title_label = SubtitleLabel("应用设置", content_widget)
+				title_label.setObjectName("settingsTitleLabel")
+				fluent_self.viewLayout.addWidget(title_label)
+			tabs = QTabWidget(content_widget)
+			tabs.setObjectName("settingsTabs")
+			content_layout.addWidget(tabs, 1)
+			self._populate_tabs(tabs)
+			if hasattr(fluent_self, "viewLayout"):
+				fluent_self.viewLayout.addWidget(content_widget)
+			else:
+				layout = QVBoxLayout(self)
+				layout.addWidget(content_widget)
+			if hasattr(fluent_self, "widget") and fluent_self.widget is not None:
+				fluent_self.widget.setMinimumWidth(520)
+			if hasattr(fluent_self, "yesButton"):
+				fluent_self.yesButton.setText("保存")
+			if hasattr(fluent_self, "cancelButton"):
+				fluent_self.cancelButton.setText("取消")
+			reset_button = PrimaryPushButton("恢复默认", self)
+			reset_button.clicked.connect(self.restore_defaults)
+			if hasattr(fluent_self, "buttonLayout"):
+				fluent_self.buttonLayout.insertWidget(0, reset_button)
+			else:
+				content_layout.addWidget(reset_button)
+		else:
+			container_layout = QVBoxLayout(self)
+			container_layout.setContentsMargins(16, 16, 16, 16)
+			container_layout.setSpacing(12)
+			tabs = QTabWidget(self)
+			tabs.setObjectName("settingsTabs")
+			container_layout.addWidget(tabs, 1)
+			self._populate_tabs(tabs)
+			buttons = QDialogButtonBox(
+				QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+				parent=self,
+			)
+			reset_button = buttons.addButton("恢复默认", QDialogButtonBox.ButtonRole.ResetRole)
+			reset_button.clicked.connect(self.restore_defaults)
+			buttons.accepted.connect(self.accept)
+			buttons.rejected.connect(self.reject)
+			container_layout.addWidget(buttons)
+
+	def _populate_tabs(self, tabs: QTabWidget) -> None:
+		self._shortcut_editors.clear()
+		self._general_checkboxes.clear()
+		shortcuts_widget = QWidget(tabs)
+		shortcuts_layout = QFormLayout(shortcuts_widget)
+		shortcuts_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+		shortcuts_layout.setContentsMargins(8, 12, 8, 12)
+		shortcuts_layout.setSpacing(10)
+		for action_id, meta in self._settings.shortcut_items():
+			label_text = meta.get("label", action_id)
+			label_widget = SubtitleLabel(label_text, shortcuts_widget) if HAVE_FLUENT_WIDGETS else QLabel(label_text, shortcuts_widget)
+			editor = QKeySequenceEdit(shortcuts_widget)
+			sequence = self._settings.get_shortcut(action_id)
+			if sequence:
+				editor.setKeySequence(QKeySequence(sequence))
+			editor.setClearButtonEnabled(True)
+			editor.setToolTip(meta.get("description", ""))
+			label_widget.setToolTip(meta.get("description", ""))
+			shortcuts_layout.addRow(label_widget, editor)
+			self._shortcut_editors[action_id] = editor
+		shortcuts_widget.setLayout(shortcuts_layout)
+		tabs.addTab(shortcuts_widget, "快捷键")
+
+		general_widget = QWidget(tabs)
+		general_layout = QVBoxLayout(general_widget)
+		general_layout.setContentsMargins(16, 16, 16, 16)
+		general_layout.setSpacing(10)
+		for option_key, meta in self._settings.general_items():
+			checkbox = QCheckBox(meta.get("label", option_key), general_widget)
+			checkbox.setChecked(self._settings.get_general(option_key))
+			description = meta.get("description", "")
+			if description:
+				checkbox.setToolTip(description)
+			general_layout.addWidget(checkbox)
+			self._general_checkboxes[option_key] = checkbox
+		general_layout.addStretch(1)
+		tabs.addTab(general_widget, "常规")
+
+	def restore_defaults(self) -> None:
+		for action_id, editor in self._shortcut_editors.items():
+			default_value = str(self._settings.DEFAULTS["shortcuts"].get(action_id, ""))
+			editor.setKeySequence(QKeySequence(default_value))
+		for option_key, checkbox in self._general_checkboxes.items():
+			checkbox.setChecked(bool(self._settings.DEFAULTS["general"].get(option_key, False)))
+
+	def accept(self) -> None:  # noqa: D401
+		conflicts: Dict[str, List[str]] = {}
+		shortcuts_payload: Dict[str, str] = {}
+		for action_id, editor in self._shortcut_editors.items():
+			sequence = editor.keySequence().toString(QKeySequence.SequenceFormat.PortableText).strip()
+			shortcuts_payload[action_id] = sequence
+			if sequence:
+				conflicts.setdefault(sequence, []).append(self._settings.get_shortcut_label(action_id))
+		duplicates = {seq: labels for seq, labels in conflicts.items() if len(labels) > 1}
+		if duplicates:
+			rows = [f"{seq}: {', '.join(labels)}" for seq, labels in duplicates.items()]
+			show_warning(self, "快捷键冲突", "以下快捷键存在冲突:\n" + "\n".join(rows))
+			return
+		general_payload: Dict[str, bool] = {key: checkbox.isChecked() for key, checkbox in self._general_checkboxes.items()}
+		self._settings.apply(shortcuts=shortcuts_payload, general=general_payload)
+		super().accept()
+
 # -- Fluent workflow interface --------------------------------------------
+
 
 
 class WorkflowInterface(QWidget):
 	"""Workflow editor surface using Fluent UI components when available."""
 
-	def __init__(self, parent: Optional[QWidget] = None) -> None:
+	def __init__(
+		self,
+		settings: SettingsManager,
+		open_settings_callback: Optional[Callable[[], None]] = None,
+		parent: Optional[QWidget] = None,
+	) -> None:
 		super().__init__(parent)
+		self._settings = settings
+		self._open_settings_callback = open_settings_callback or (lambda: None)
+		self._actions: Dict[str, QAction] = {}
+		self._button_map: Dict[str, QPushButton] = {}
 		self._current_workflow_path: Optional[Path] = None
 		self._unsaved_changes = False
 		self._last_directory = str(Path.home())
@@ -1496,12 +1638,15 @@ class WorkflowInterface(QWidget):
 		self.new_workflow_button = self._make_side_button("新建", right_panel)
 		self.new_workflow_button.clicked.connect(self.new_workflow)
 		file_controls_top.addWidget(self.new_workflow_button)
+		self._button_map["new_workflow"] = self.new_workflow_button
 		self.open_workflow_button = self._make_side_button("打开", right_panel)
 		self.open_workflow_button.clicked.connect(self.open_workflow)
 		file_controls_top.addWidget(self.open_workflow_button)
+		self._button_map["open_workflow"] = self.open_workflow_button
 		self.save_workflow_button = self._make_side_button("保存", right_panel)
 		self.save_workflow_button.clicked.connect(self.save_workflow)
 		file_controls_top.addWidget(self.save_workflow_button)
+		self._button_map["save_workflow"] = self.save_workflow_button
 		right_layout.addLayout(file_controls_top)
 		file_controls_bottom = QHBoxLayout()
 		file_controls_bottom.setContentsMargins(0, 0, 0, 0)
@@ -1509,6 +1654,7 @@ class WorkflowInterface(QWidget):
 		self.save_as_workflow_button = self._make_side_button("另存为", right_panel)
 		self.save_as_workflow_button.clicked.connect(self.save_workflow_as)
 		file_controls_bottom.addWidget(self.save_as_workflow_button)
+		self._button_map["save_as_workflow"] = self.save_as_workflow_button
 		self.delete_workflow_button = self._make_side_button("删除", right_panel)
 		self.delete_workflow_button.clicked.connect(self.delete_workflow_file)
 		file_controls_bottom.addWidget(self.delete_workflow_button)
@@ -1521,6 +1667,11 @@ class WorkflowInterface(QWidget):
 		self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.run_button.setMinimumHeight(40)
 		right_layout.addWidget(self.run_button)
+		self._button_map["run_workflow"] = self.run_button
+		self.settings_button = self._make_side_button("设置", right_panel)
+		self.settings_button.clicked.connect(self._invoke_settings)
+		right_layout.addWidget(self.settings_button)
+		self._button_map["open_settings"] = self.settings_button
 		zoom_controls = QHBoxLayout()
 		zoom_controls.setContentsMargins(0, 0, 0, 0)
 		zoom_controls.setSpacing(8)
@@ -1528,15 +1679,19 @@ class WorkflowInterface(QWidget):
 		self.zoom_out_button = self._make_side_button("缩小", right_panel)
 		self.zoom_out_button.clicked.connect(self.handle_zoom_out)
 		zoom_controls.addWidget(self.zoom_out_button)
+		self._button_map["zoom_out"] = self.zoom_out_button
 		self.zoom_reset_button = self._make_side_button("重置", right_panel)
 		self.zoom_reset_button.clicked.connect(self.handle_zoom_reset)
 		zoom_controls.addWidget(self.zoom_reset_button)
+		self._button_map["zoom_reset"] = self.zoom_reset_button
 		self.zoom_in_button = self._make_side_button("放大", right_panel)
 		self.zoom_in_button.clicked.connect(self.handle_zoom_in)
 		zoom_controls.addWidget(self.zoom_in_button)
+		self._button_map["zoom_in"] = self.zoom_in_button
 		self.zoom_fit_button = self._make_side_button("适配", right_panel)
 		self.zoom_fit_button.clicked.connect(self.fit_workflow_to_nodes)
 		zoom_controls.addWidget(self.zoom_fit_button)
+		self._button_map["zoom_fit"] = self.zoom_fit_button
 		right_layout.addLayout(zoom_controls)
 		log_label = BodyLabel("日志", right_panel) if HAVE_FLUENT_WIDGETS else QLabel("日志", right_panel)
 		log_header = QHBoxLayout()
@@ -1547,6 +1702,7 @@ class WorkflowInterface(QWidget):
 		self.clear_log_button = self._make_side_button("清空日志", right_panel)
 		self.clear_log_button.clicked.connect(self.clear_log)
 		log_header.addWidget(self.clear_log_button)
+		self._button_map["clear_log"] = self.clear_log_button
 		right_layout.addLayout(log_header)
 		right_layout.addWidget(self.log_widget, 1)
 
@@ -1581,6 +1737,9 @@ class WorkflowInterface(QWidget):
 		self.runner.started.connect(lambda: self.append_log("开始执行工作流"))
 		self.runner.finished.connect(self.on_execution_finished)
 		self.scene.modified.connect(self.mark_workflow_modified)
+		self._create_actions()
+		self._settings.shortcuts_changed.connect(self.reload_shortcuts)
+		self.reload_shortcuts()
 		self.update_file_display()
 
 	def _make_side_button(self, text: str, parent: QWidget) -> QPushButton:
@@ -1738,25 +1897,26 @@ class WorkflowInterface(QWidget):
 			show_information(self, "删除工作流", "当前没有关联的工作流文件")
 			return
 		path = self._current_workflow_path
-		if HAVE_FLUENT_WIDGETS and MessageBox is not None:
-			box = MessageBox("删除工作流", f"确定要删除文件 {path.name} 吗？", self)
-			if hasattr(box, "yesButton"):
-				box.yesButton.setText("删除")
-			if hasattr(box, "cancelButton"):
-				box.cancelButton.setText("取消")
-				box.cancelButton.show()
-			if box.exec() != QDialog.DialogCode.Accepted:
-				return
-		else:
-			reply = QMessageBox.question(
-				self,
-				"删除工作流",
-				f"确定要删除文件 {path.name} 吗？",
-				QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-				QMessageBox.StandardButton.No,
-			)
-			if reply != QMessageBox.StandardButton.Yes:
-				return
+		if self._settings.get_general("confirm_before_delete"):
+			if HAVE_FLUENT_WIDGETS and MessageBox is not None:
+				box = MessageBox("删除工作流", f"确定要删除文件 {path.name} 吗？", self)
+				if hasattr(box, "yesButton"):
+					box.yesButton.setText("删除")
+				if hasattr(box, "cancelButton"):
+					box.cancelButton.setText("取消")
+					box.cancelButton.show()
+				if box.exec() != QDialog.DialogCode.Accepted:
+					return
+			else:
+				reply = QMessageBox.question(
+					self,
+					"删除工作流",
+					f"确定要删除文件 {path.name} 吗？",
+					QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+					QMessageBox.StandardButton.No,
+				)
+				if reply != QMessageBox.StandardButton.Yes:
+					return
 		file_existed = path.exists()
 		try:
 			if file_existed:
@@ -1831,6 +1991,11 @@ class WorkflowInterface(QWidget):
 		if not self.scene.graph.nodes:
 			show_information(self, "运行工作流", "请先添加节点")
 			return
+		if self._settings.get_general("auto_save_before_run") and self._unsaved_changes:
+			self.save_workflow()
+			if self._unsaved_changes:
+				self.show_status("运行已取消：更改未保存", 4000)
+				return
 		try:
 			self.scene.graph.topological_order()
 		except ExecutionError as exc:
@@ -1847,6 +2012,49 @@ class WorkflowInterface(QWidget):
 
 	def show_status(self, message: str, timeout_ms: int = 0) -> None:
 		self.status_bar.showMessage(message, timeout_ms)
+
+	def reload_shortcuts(self, *_args, **_kwargs) -> None:
+		for action_id, action in self._actions.items():
+			sequence = self._settings.get_shortcut(action_id)
+			if sequence:
+				action.setShortcut(QKeySequence(sequence))
+			else:
+				action.setShortcut(QKeySequence())
+		self._update_button_tooltips()
+
+	def _create_actions(self) -> None:
+		action_specs: Dict[str, Tuple[str, Callable[[], None]]] = {
+			"new_workflow": ("新建工作流", self.new_workflow),
+			"open_workflow": ("打开工作流", self.open_workflow),
+			"save_workflow": ("保存工作流", self.save_workflow),
+			"save_as_workflow": ("另存工作流", self.save_workflow_as),
+			"run_workflow": ("运行工作流", self.execute_workflow),
+			"zoom_in": ("放大画布", self.handle_zoom_in),
+			"zoom_out": ("缩小画布", self.handle_zoom_out),
+			"zoom_reset": ("重置缩放", self.handle_zoom_reset),
+			"zoom_fit": ("适配视图", self.fit_workflow_to_nodes),
+			"clear_log": ("清空日志", self.clear_log),
+			"open_settings": ("打开设置", self._invoke_settings),
+		}
+		for action_id, (text, handler) in action_specs.items():
+			action = QAction(text, self)
+			action.setObjectName(f"workflowAction_{action_id}")
+			action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+			action.triggered.connect(handler)
+			self.addAction(action)
+			self._actions[action_id] = action
+
+	def _update_button_tooltips(self) -> None:
+		for action_id, button in self._button_map.items():
+			label = button.text().strip() or self._settings.get_shortcut_label(action_id)
+			sequence = self._settings.get_shortcut(action_id)
+			if sequence:
+				button.setToolTip(f"{label} ({sequence})")
+			else:
+				button.setToolTip(label)
+
+	def _invoke_settings(self) -> None:
+		self._open_settings_callback()
 
 	def _apply_styles(self) -> None:
 		base_style = """
@@ -1925,7 +2133,8 @@ class MainWindow(BaseMainWindow):
 		self.setWindowTitle("Workflow Capture Studio")
 		self.resize(1200, 720)
 
-		self.workflow_interface = WorkflowInterface(self)
+		self.settings = SettingsManager()
+		self.workflow_interface = WorkflowInterface(self.settings, self.open_settings_dialog, self)
 		if HAVE_FLUENT_WIDGETS and isinstance(self, FluentWindow):
 			self.workflow_interface.setObjectName("workflow-interface")
 			icon = FluentIcon.HOME if FluentIcon is not None else QIcon()
@@ -1944,3 +2153,11 @@ class MainWindow(BaseMainWindow):
 		else:
 			self.setCentralWidget(self.workflow_interface)
 		self.workflow_interface.set_base_window_title(self.windowTitle())
+		self.settings.settings_changed.connect(self._notify_settings_updated)
+
+	def open_settings_dialog(self) -> None:
+		dialog = SettingsDialog(self.settings, self)
+		dialog.exec()
+
+	def _notify_settings_updated(self, _payload: Dict[str, object]) -> None:
+		self.workflow_interface.show_status("设置已更新", 2000)
