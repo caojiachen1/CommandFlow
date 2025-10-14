@@ -1584,9 +1584,17 @@ class ConfigDialog(ConfigDialogBase):
 			widget_cls = FluentComboBox if HAVE_FLUENT_WIDGETS else QComboBox
 			widget = widget_cls(self)
 			choices = cast(List[Tuple[str, str]], field.get("choices", []))
-			for ident, label in choices:
-				widget.addItem(label, ident)
+			label_map = {label: ident for ident, label in choices}
+			for idx, (ident, label) in enumerate(choices):
+				widget.addItem(label)
+				widget.setItemData(idx, ident)
+			widget.setProperty("_workflow_choice_map", label_map)
 			index = widget.findData(value)
+			if index < 0 and value is not None:
+				for idx, (ident, _label) in enumerate(choices):
+					if ident == value:
+						index = idx
+						break
 			if index >= 0:
 				widget.setCurrentIndex(index)
 			return widget
@@ -1608,15 +1616,23 @@ class ConfigDialog(ConfigDialogBase):
 				result[key] = widget.isChecked()
 			elif isinstance(widget, PathPicker):
 				result[key] = widget.value()
-			elif isinstance(widget, QSpinBox):
+			elif isinstance(widget, (FluentSpinBox, QSpinBox)):
 				result[key] = widget.value()
-			elif isinstance(widget, QDoubleSpinBox):
+			elif isinstance(widget, (FluentDoubleSpinBox, QDoubleSpinBox)):
 				result[key] = widget.value()
-			elif isinstance(widget, QComboBox):
-				result[key] = widget.currentData()
-			elif isinstance(widget, QTextEdit):
+			elif isinstance(widget, (FluentComboBox, QComboBox)):
+				data = widget.currentData()
+				if data is None:
+					mapping = widget.property("_workflow_choice_map")
+					text_value = widget.currentText()
+					if isinstance(mapping, dict) and text_value in mapping:
+						data = mapping[text_value]
+					else:
+						data = text_value
+				result[key] = data
+			elif isinstance(widget, (FluentTextEdit, QTextEdit)):
 				result[key] = widget.toPlainText()
-			elif isinstance(widget, QLineEdit):
+			elif isinstance(widget, (FluentLineEdit, QLineEdit)):
 				result[key] = widget.text()
 		return result
 

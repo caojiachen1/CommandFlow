@@ -1464,6 +1464,98 @@ class FileMoveNode(WorkflowNodeModel):
         return destination
 
 
+class SwitchContextNode(WorkflowNodeModel):
+    type_name = "switch_context"
+    display_name = "切换窗口"
+    category = "系统操作"
+
+    _MODE_CHOICES: Dict[str, Tuple[List[str], str]] = {
+        "program_next": (["alt", "tab"], "切换到下一个程序"),
+        "program_prev": (["alt", "shift", "tab"], "切换到上一个程序"),
+        "desktop_next": (["win", "ctrl", "right"], "切换到下一个桌面"),
+        "desktop_prev": (["win", "ctrl", "left"], "切换到上一个桌面"),
+        "task_view": (["win", "tab"], "打开任务视图"),
+        "show_desktop": (["win", "d"], "显示桌面"),
+    }
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "mode": "program_next",
+            "repeat": 1,
+            "interval": 0.12,
+            "pause_between": 0.15,
+        }
+
+    def validate_config(self) -> None:
+        cfg = self.config
+        mode = cfg.get("mode")
+        if mode not in self._MODE_CHOICES:
+            raise ValueError("无效的切换模式")
+        repeat = cfg.get("repeat")
+        if not isinstance(repeat, int) or repeat <= 0:
+            raise ValueError("次数必须为正整数")
+        for key in ("interval", "pause_between"):
+            value = cfg.get(key)
+            if not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{key} 必须为非负数")
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "mode",
+                "label": "切换方式",
+                "type": "choices",
+                "choices": [
+                    ("program_next", "下一个程序 (Alt+Tab)"),
+                    ("program_prev", "上一个程序 (Alt+Shift+Tab)"),
+                    ("desktop_next", "下一个桌面 (Win+Ctrl+→)"),
+                    ("desktop_prev", "上一个桌面 (Win+Ctrl+←)"),
+                    ("task_view", "任务视图 (Win+Tab)"),
+                    ("show_desktop", "显示桌面 (Win+D)"),
+                ],
+            },
+            {
+                "key": "repeat",
+                "label": "重复次数",
+                "type": "int",
+                "min": 1,
+                "max": 10,
+            },
+            {
+                "key": "interval",
+                "label": "按键间隔 (秒)",
+                "type": "float",
+                "min": 0.0,
+                "max": 1.0,
+                "step": 0.01,
+            },
+            {
+                "key": "pause_between",
+                "label": "重复间隔 (秒)",
+                "type": "float",
+                "min": 0.0,
+                "max": 2.0,
+                "step": 0.05,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
+        cfg = self.config
+        keys, description = self._MODE_CHOICES[cfg["mode"]]
+        repeat = int(cfg.get("repeat", 1))
+        press_interval = float(cfg.get("interval", 0.12))
+        pause = float(cfg.get("pause_between", 0.15))
+        for index in range(repeat):
+            runtime.press_hotkey(list(keys), interval=press_interval)
+            if index < repeat - 1 and pause > 0:
+                time.sleep(pause)
+        context.record(self.id, {
+            "mode": cfg["mode"],
+            "description": description,
+            "repeat": repeat,
+        })
+
+
 class FileDeleteNode(WorkflowNodeModel):
     type_name = "file_delete"
     display_name = "删除文件/目录"
@@ -1632,6 +1724,7 @@ NODE_REGISTRY = {
     FileMoveNode.type_name: FileMoveNode,
     FileDeleteNode.type_name: FileDeleteNode,
     CommandNode.type_name: CommandNode,
+    SwitchContextNode.type_name: SwitchContextNode,
 }
 
 
