@@ -1503,34 +1503,72 @@ class WindowPicker(QWidget):
 		placeholder: str = "",
 	) -> None:
 		super().__init__(parent)
+		self.setObjectName("windowPickerRoot")
 		self._available = sys.platform == "win32"
 		self._selected_hwnd = 0
 		self._updating_text = False
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(0, 0, 0, 0)
-		layout.setSpacing(6)
-		line_edit_cls = FluentLineEdit if HAVE_FLUENT_WIDGETS else QLineEdit
-		self._line_edit = line_edit_cls(self)
-		if placeholder:
-			self._line_edit.setPlaceholderText(placeholder)
-		layout.addWidget(self._line_edit)
-		controls = QHBoxLayout()
-		controls.setContentsMargins(0, 0, 0, 0)
-		controls.setSpacing(6)
-		self._status_label = QLabel("正在监控窗口...", self)
-		self._status_label.setStyleSheet("color: #969696; font-size: 11px;")
-		controls.addWidget(self._status_label)
-		controls.addStretch(1)
+		layout.setSpacing(10)
+
+		header = QHBoxLayout()
+		header.setContentsMargins(0, 0, 0, 0)
+		header.setSpacing(8)
+		title_cls = SubtitleLabel if HAVE_FLUENT_WIDGETS else QLabel
+		self._title_label = title_cls("窗口列表", self)
+		if not HAVE_FLUENT_WIDGETS:
+			title_font = QFont(self._title_label.font())
+			title_font.setPointSize(title_font.pointSize() + 1)
+			title_font.setBold(True)
+			self._title_label.setFont(title_font)
+		header.addWidget(self._title_label)
+		header.addStretch(1)
 		button_cls = PrimaryPushButton if HAVE_FLUENT_WIDGETS else QPushButton
 		self._refresh_button = button_cls("刷新", self)
 		self._refresh_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 		self._refresh_button.clicked.connect(self.refresh_list)
-		controls.addWidget(self._refresh_button)
-		layout.addLayout(controls)
-		self._list_widget = QListWidget(self)
+		header.addWidget(self._refresh_button)
+		layout.addLayout(header)
+
+		line_edit_cls = FluentLineEdit if HAVE_FLUENT_WIDGETS else QLineEdit
+		self._line_edit = line_edit_cls(self)
+		if hasattr(self._line_edit, "setClearButtonEnabled"):
+			self._line_edit.setClearButtonEnabled(True)
+		if placeholder:
+			self._line_edit.setPlaceholderText(placeholder)
+		layout.addWidget(self._line_edit)
+
+		self._hint_label = QLabel("输入关键字可快速定位，或直接从列表选择。", self)
+		self._hint_label.setObjectName("windowPickerHint")
+		layout.addWidget(self._hint_label)
+
+		self._list_frame = QFrame(self)
+		self._list_frame.setObjectName("windowPickerFrame")
+		frame_layout = QVBoxLayout(self._list_frame)
+		frame_layout.setContentsMargins(6, 6, 6, 6)
+		frame_layout.setSpacing(4)
+		self._list_widget = QListWidget(self._list_frame)
+		self._list_widget.setObjectName("windowPickerList")
 		self._list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-		self._list_widget.setMinimumHeight(170)
-		layout.addWidget(self._list_widget)
+		self._list_widget.setUniformItemSizes(True)
+		self._list_widget.setAlternatingRowColors(True)
+		self._list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+		self._list_widget.setMinimumHeight(190)
+		frame_layout.addWidget(self._list_widget)
+		layout.addWidget(self._list_frame)
+
+		footer = QHBoxLayout()
+		footer.setContentsMargins(0, 0, 0, 0)
+		footer.setSpacing(8)
+		self._count_label = QLabel("0 个窗口", self)
+		self._count_label.setObjectName("windowPickerCount")
+		footer.addWidget(self._count_label)
+		footer.addStretch(1)
+		self._status_label = QLabel("等待刷新", self)
+		self._status_label.setObjectName("windowPickerStatus")
+		footer.addWidget(self._status_label)
+		layout.addLayout(footer)
+
 		if hasattr(self._line_edit, "textEdited"):
 			self._line_edit.textEdited.connect(self._on_text_edited)
 		else:  # pragma: no cover - fallback
@@ -1544,11 +1582,13 @@ class WindowPicker(QWidget):
 			self.refresh_list()
 			self._timer.start()
 		else:
-			self._status_label.setText("窗口监控仅在 Windows 上可用")
 			self._refresh_button.setEnabled(False)
+			self._hint_label.setText("当前平台不支持窗口监控")
 			placeholder_item = QListWidgetItem("当前平台不支持窗口枚举")
 			placeholder_item.setFlags(Qt.ItemFlag.NoItemFlags)
 			self._list_widget.addItem(placeholder_item)
+			self._update_metadata(0, refresh_successful=False)
+		self._apply_style()
 
 	def _apply_initial(self, initial: Any) -> None:
 		title = ""
@@ -1584,6 +1624,10 @@ class WindowPicker(QWidget):
 			self._list_widget.addItem(item)
 			if current_hwnd and hwnd == current_hwnd:
 				item.setSelected(True)
+		if not windows:
+			placeholder = QListWidgetItem("未检测到窗口，激活目标窗口后再试。")
+			placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+			self._list_widget.addItem(placeholder)
 		if not self._list_widget.selectedItems() and current_title:
 			for index in range(self._list_widget.count()):
 				item = self._list_widget.item(index)
@@ -1592,7 +1636,7 @@ class WindowPicker(QWidget):
 					item.setSelected(True)
 					break
 		self._list_widget.blockSignals(False)
-		self._status_label.setText(f"监控窗口数: {len(windows)}")
+		self._update_metadata(len(windows))
 
 	def _on_selection_changed(self) -> None:
 		items = self._list_widget.selectedItems()
@@ -1607,6 +1651,9 @@ class WindowPicker(QWidget):
 		self._selected_hwnd = hwnd_value if hwnd_value else 0
 		self._updating_text = True
 		self._line_edit.setText(title)
+		if hasattr(self._line_edit, "deselect"):
+			self._line_edit.deselect()
+			self._line_edit.setCursorPosition(len(title))
 		self._updating_text = False
 
 	def _on_text_edited(self, _text: str) -> None:
@@ -1619,6 +1666,82 @@ class WindowPicker(QWidget):
 			"title": self._line_edit.text().strip(),
 			"hwnd": int(self._selected_hwnd) if self._selected_hwnd else 0,
 		}
+
+	def _update_metadata(self, window_count: int, *, refresh_successful: bool = True) -> None:
+		self._count_label.setText(f"{window_count} 个窗口")
+		if not refresh_successful:
+			return
+		if window_count <= 0:
+			self._status_label.setText("未检测到可用窗口")
+		else:
+			self._status_label.setText(f"最后刷新: {time.strftime('%H:%M:%S')}")
+
+	def _apply_style(self) -> None:
+		self._list_frame.setFrameShape(QFrame.Shape.StyledPanel)
+		self._list_frame.setFrameShadow(QFrame.Shadow.Plain)
+		if HAVE_FLUENT_WIDGETS:
+			frame_border = "rgba(255, 255, 255, 55)"
+			frame_background = "rgba(255, 255, 255, 28)"
+			hint_color = "rgba(255, 255, 255, 200)"
+			footer_color = "rgba(255, 255, 255, 220)"
+			item_text_color = "rgba(245, 245, 245, 240)"
+			item_selected_bg = "rgba(12, 12, 12, 230)"
+			item_selected_fg = "rgba(245, 245, 245, 240)"
+			item_hover_bg = "rgba(32, 32, 32, 200)"
+		else:
+			frame_border = "rgba(120, 120, 120, 90)"
+			frame_background = "rgba(240, 240, 240, 80)"
+			hint_color = "rgba(120, 120, 120, 190)"
+			footer_color = "rgba(90, 90, 90, 220)"
+			item_text_color = ""
+			item_selected_bg = "rgba(64, 132, 214, 160)"
+			item_selected_fg = "white"
+			item_hover_bg = "rgba(64, 132, 214, 90)"
+		item_text_rule = f"color: {item_text_color};" if item_text_color else ""
+		base_style = f"""
+		#windowPickerRoot {{
+			background-color: transparent;
+		}}
+		#windowPickerHint {{
+			color: {hint_color};
+			font-size: 12px;
+		}}
+		#windowPickerFrame {{
+			border: 1px solid {frame_border};
+			border-radius: 10px;
+			background-color: {frame_background};
+		}}
+		#windowPickerList {{
+			border: none;
+			background: transparent;
+			padding: 2px;
+		}}
+		#windowPickerList::item {{
+			padding: 6px 8px;
+			border-radius: 6px;
+			{item_text_rule}
+		}}
+		#windowPickerList::item:selected {{
+			background-color: {item_selected_bg};
+			color: {item_selected_fg};
+		}}
+		#windowPickerList::item:hover {{
+			background-color: {item_hover_bg};
+		}}
+		#windowPickerCount,
+		#windowPickerStatus {{
+			color: {footer_color};
+			font-size: 12px;
+		}}
+		"""
+		self.setStyleSheet(base_style)
+		if HAVE_FLUENT_WIDGETS:
+			icon_attr = getattr(FluentIcon, "SYNC", None)
+			if icon_attr is not None:
+				try:
+					self._refresh_button.setIcon(icon_attr.icon())
+				except Exception:  # pragma: no cover - fluent icon optional
+					pass
 
 
 class ConfigDialog(ConfigDialogBase):
@@ -2675,6 +2798,23 @@ class WorkflowInterface(QWidget):
 		}
 		QPushButton#workflowSideButton:pressed {
 			background: rgba(255, 255, 255, 18);
+		}
+		QListWidget,
+		QListView,
+		QTreeWidget {
+			outline: none;
+		}
+		QListWidget::item:selected:focus,
+		QListView::item:selected:focus,
+		QTreeWidget::item:selected:focus {
+			outline: none;
+			border: none;
+		}
+		QListWidget::item:focus,
+		QListView::item:focus,
+		QTreeWidget::item:focus {
+			outline: none;
+			border: none;
 		}
 		"""
 		if not HAVE_FLUENT_WIDGETS:
