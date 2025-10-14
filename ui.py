@@ -5,9 +5,12 @@ This module contains all GUI-related classes and functions, separated from the m
 
 from __future__ import annotations
 
+import ctypes
+import itertools
 import json
 import math
 import sys
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -15,8 +18,29 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
+if sys.platform == "win32":  # pragma: no cover - platform-specific hotkeys
+	from ctypes import wintypes
+else:  # pragma: no cover - platform-specific hotkeys
+	wintypes = None  # type: ignore[assignment]
+
 from automation_runtime import PyAutoGuiRuntime, get_system_dpi_scale
-from PySide6.QtCore import QPoint, QPointF, Qt, QMimeData, QObject, Signal, QRectF, QLineF, QRect, QSizeF, QSize
+from PySide6.QtCore import (
+	QAbstractNativeEventFilter,
+	QCoreApplication,
+	QPoint,
+	QPointF,
+	Qt,
+	QMimeData,
+	QObject,
+	Signal,
+	QRectF,
+	QLineF,
+	QRect,
+	QSizeF,
+	QSize,
+	QTimer,
+	QThread,
+)
 from PySide6.QtGui import (
 	QAction,
 	QColor,
@@ -67,6 +91,11 @@ from PySide6.QtWidgets import (
 	QFrame,
 	QTabWidget,
 )
+
+try:
+	from PySide6.QtGui import QKeyCombination  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - fallback for older PySide6
+	QKeyCombination = None  # type: ignore[assignment]
 
 try:
 	from qfluentwidgets import (
@@ -199,6 +228,182 @@ def show_information(parent: QWidget, title: str, message: str) -> None:
 def show_warning(parent: QWidget, title: str, message: str) -> None:
 	_show_message(parent, title, message, "warning")
 
+
+# -- Global hotkey management ---------------------------------------------
+
+
+class GlobalHotkeyManager(QObject, QAbstractNativeEventFilter):
+	"""Register and dispatch system-wide hotkeys on supported platforms."""
+
+	MOD_ALT = 0x0001
+	MOD_CONTROL = 0x0002
+	MOD_SHIFT = 0x0004
+	MOD_WIN = 0x0008
+	MOD_NOREPEAT = 0x4000
+	WM_HOTKEY = 0x0312
+
+	def __init__(self, parent: Optional[QObject] = None) -> None:
+		QObject.__init__(self, parent)
+		QAbstractNativeEventFilter.__init__(self)
+		self._available = sys.platform == "win32" and wintypes is not None and QKeyCombination is not None
+		self._window: Optional[QWidget] = None
+		self._hwnd: int = 0
+		self._callbacks: Dict[str, Callable[[], None]] = {}
+		self._sequence_map: Dict[str, str] = {}
+		self._action_to_id: Dict[str, int] = {}
+		self._id_to_action: Dict[int, str] = {}
+		self._id_counter = itertools.count(1)
+		self._user32 = ctypes.windll.user32 if self._available else None
+		self._app = QCoreApplication.instance()
+		if self._available and self._app is not None:
+			self._app.installNativeEventFilter(self)
+
+	@property
+	def is_available(self) -> bool:
+		return bool(self._available and self._user32 is not None)
+
+	def set_window(self, window: Optional[QWidget]) -> None:
+		if not self.is_available:
+			self._window = window
+			return
+		previous_hwnd = self._hwnd
+		self._window = window
+		self._hwnd = int(window.winId()) if window is not None else 0
+		if previous_hwnd != self._hwnd:
+			self._unregister_all()
+			self._register_all()
+
+	def set_callback(self, action_id: str, callback: Callable[[], None]) -> None:
+		self._callbacks[action_id] = callback
+
+	def update_hotkeys(self, mapping: Dict[str, str]) -> Dict[str, str]:
+		self._sequence_map = dict(mapping)
+		if not self.is_available or self._hwnd == 0:
+			return {}
+		return self._register_all()
+
+	def cleanup(self) -> None:
+		if not self.is_available:
+			return
+		self._unregister_all()
+		if self._app is not None:
+			self._app.removeNativeEventFilter(self)
+
+	def nativeEventFilter(self, event_type, message):
+		if not self.is_available or event_type not in ("windows_generic_MSG", "windows_dispatcher_MSG"):
+			return False, 0
+		if wintypes is None:  # pragma: no cover - defensive
+			return False, 0
+		msg = wintypes.MSG.from_address(int(message))
+		if msg.message != self.WM_HOTKEY:
+			return False, 0
+		action_id = self._id_to_action.get(int(msg.wParam))
+		if not action_id:
+			return False, 0
+		callback = self._callbacks.get(action_id)
+		if callback is None:
+			return False, 0
+		QTimer.singleShot(0, callback)
+		return True, 0
+
+	def _register_all(self) -> Dict[str, str]:
+		errors: Dict[str, str] = {}
+		self._unregister_all()
+		if not self.is_available or self._hwnd == 0 or self._user32 is None:
+			return errors
+		self._id_counter = itertools.count(1)
+		for action_id, sequence in self._sequence_map.items():
+			if not sequence:
+				continue
+			parsed = self._parse_sequence(sequence)
+			if parsed is None:
+				errors[action_id] = "无法解析快捷键"
+				continue
+			modifiers, key = parsed
+			hotkey_id = next(self._id_counter)
+			if not self._user32.RegisterHotKey(self._hwnd, hotkey_id, modifiers | self.MOD_NOREPEAT, key):
+				errors[action_id] = "注册失败，可能已被占用"
+				continue
+			self._action_to_id[action_id] = hotkey_id
+			self._id_to_action[hotkey_id] = action_id
+		return errors
+
+	def _unregister_all(self) -> None:
+		if not self.is_available or self._user32 is None:
+			self._action_to_id.clear()
+			self._id_to_action.clear()
+			return
+		if self._hwnd == 0:
+			self._action_to_id.clear()
+			self._id_to_action.clear()
+			return
+		for hotkey_id in list(self._id_to_action.keys()):
+			self._user32.UnregisterHotKey(self._hwnd, hotkey_id)
+		self._action_to_id.clear()
+		self._id_to_action.clear()
+
+	def _parse_sequence(self, sequence: str) -> Optional[Tuple[int, int]]:
+		if not sequence or QKeyCombination is None:
+			return None
+		qt_sequence = QKeySequence(sequence)
+		if qt_sequence.count() == 0:
+			return None
+		combined = int(qt_sequence[0])  # type: ignore[index]
+		combo = QKeyCombination.fromCombined(combined)
+		qt_key = combo.key()
+		if qt_key == Qt.Key.Key_unknown:
+			return None
+		modifiers = combo.keyboardModifiers()
+		vk_code = self._qt_key_to_vk(qt_key)
+		if vk_code is None:
+			return None
+		modifier_mask = 0
+		if modifiers & Qt.KeyboardModifier.ControlModifier:
+			modifier_mask |= self.MOD_CONTROL
+		if modifiers & Qt.KeyboardModifier.ShiftModifier:
+			modifier_mask |= self.MOD_SHIFT
+		if modifiers & Qt.KeyboardModifier.AltModifier:
+			modifier_mask |= self.MOD_ALT
+		if modifiers & Qt.KeyboardModifier.MetaModifier:
+			modifier_mask |= self.MOD_WIN
+		return modifier_mask, vk_code
+
+	@staticmethod
+	def _qt_key_to_vk(qt_key: Qt.Key) -> Optional[int]:
+		# Direct mapping for letters and digits
+		if Qt.Key.Key_A <= qt_key <= Qt.Key.Key_Z:
+			return int(qt_key)
+		if Qt.Key.Key_0 <= qt_key <= Qt.Key.Key_9:
+			return int(qt_key)
+		function_keys = {
+			Qt.Key.Key_F1: 0x70,
+			Qt.Key.Key_F2: 0x71,
+			Qt.Key.Key_F3: 0x72,
+			Qt.Key.Key_F4: 0x73,
+			Qt.Key.Key_F5: 0x74,
+			Qt.Key.Key_F6: 0x75,
+			Qt.Key.Key_F7: 0x76,
+			Qt.Key.Key_F8: 0x77,
+			Qt.Key.Key_F9: 0x78,
+			Qt.Key.Key_F10: 0x79,
+			Qt.Key.Key_F11: 0x7A,
+			Qt.Key.Key_F12: 0x7B,
+		}
+		if qt_key in function_keys:
+			return function_keys[qt_key]
+		special_keys = {
+			Qt.Key.Key_Space: 0x20,
+			Qt.Key.Key_Tab: 0x09,
+			Qt.Key.Key_Backspace: 0x08,
+			Qt.Key.Key_Return: 0x0D,
+			Qt.Key.Key_Enter: 0x0D,
+			Qt.Key.Key_Escape: 0x1B,
+			Qt.Key.Key_Plus: 0xBB,
+			Qt.Key.Key_Minus: 0xBD,
+		}
+		if qt_key in special_keys:
+			return special_keys[qt_key]
+		return None
 
 # -- GUI helpers -----------------------------------------------------------
 
@@ -1420,7 +1625,7 @@ class ConfigDialog(ConfigDialogBase):
 
 
 class WorkflowRunner(QObject):
-	"""Execute workflows in a worker-friendly wrapper."""
+	"""Execute workflows on a worker thread with cancellation support."""
 
 	started = Signal()
 	finished = Signal(bool, str)
@@ -1435,25 +1640,183 @@ class WorkflowRunner(QObject):
 		self._graph_supplier = graph_supplier
 		self._runtime_factory = runtime_factory or PyAutoGuiRuntime
 		self._running = False
+		self._stop_event: Optional[threading.Event] = None
+		self._threads: List[QThread] = []
+		self._workers: List[_WorkflowRunnerWorker] = []
+
+	def is_running(self) -> bool:
+		return self._running
 
 	def run(self) -> None:
 		if self._running:
 			return
+		self._stop_event = threading.Event()
+		worker = _WorkflowRunnerWorker(
+			self._graph_supplier,
+			self._runtime_factory,
+			self._stop_event,
+		)
+		thread = QThread()
+		worker.moveToThread(thread)
+		thread.started.connect(worker.run)
+		worker.finished.connect(self._handle_worker_finished)
+		worker.finished.connect(thread.quit)
+		worker.finished.connect(worker.deleteLater)
+		thread.finished.connect(self._on_thread_finished)
+		thread.finished.connect(thread.deleteLater)
+		thread.start()
+		self._workers.append(worker)
+		self._threads.append(thread)
 		self._running = True
 		self.started.emit()
-		QApplication.processEvents()
+
+	def stop(self) -> None:
+		if not self._running or self._stop_event is None:
+			return
+		self._stop_event.set()
+
+	def _handle_worker_finished(self, success: bool, message: str) -> None:
+		sender = self.sender()
+		if isinstance(sender, _WorkflowRunnerWorker):
+			self._on_worker_finished(sender)
+		self._running = False
+		self._stop_event = None
+		self.finished.emit(success, message)
+
+	def _on_worker_finished(self, worker: _WorkflowRunnerWorker) -> None:
+		if worker in self._workers:
+			self._workers.remove(worker)
+
+	def _on_thread_finished(self) -> None:
+		sender = self.sender()
+		if not isinstance(sender, QThread):
+			return
+		thread = sender
+		if thread in self._threads:
+			self._threads.remove(thread)
+
+
+class _WorkflowRunnerWorker(QObject):
+	finished = Signal(bool, str)
+
+	def __init__(
+		self,
+		graph_supplier: Callable[[], WorkflowGraph],
+		runtime_factory: Callable[[], AutomationRuntime],
+		stop_event: threading.Event,
+		parent: Optional[QObject] = None,
+	) -> None:
+		super().__init__(parent)
+		self._graph_supplier = graph_supplier
+		self._runtime_factory = runtime_factory
+		self._stop_event = stop_event
+
+	def run(self) -> None:
 		try:
 			graph_copy = self._graph_supplier()
 			executor = WorkflowExecutor(self._runtime_factory())
-			executor.run(graph_copy)
+			executor.run(graph_copy, should_stop=self._stop_event.is_set)
 		except ExecutionError as exc:
-			self.finished.emit(False, str(exc))
+			if self._stop_event.is_set():
+				self.finished.emit(False, "执行已取消")
+			else:
+				self.finished.emit(False, str(exc))
 		except Exception as exc:  # pragma: no cover - defensive
-			self.finished.emit(False, f"执行失败: {exc}")
+			if self._stop_event.is_set():
+				self.finished.emit(False, "执行已取消")
+			else:
+				self.finished.emit(False, f"执行失败: {exc}")
 		else:
 			self.finished.emit(True, "执行完成")
-		finally:
-			self._running = False
+
+
+class QuickControlWindow(QWidget):
+	"""Compact always-on-top controller for background workflow execution."""
+
+	exit_requested = Signal()
+
+	def __init__(self, interface: "WorkflowInterface", parent: Optional[QWidget] = None) -> None:
+		super().__init__(parent)
+		self._interface = interface
+		self.setWindowTitle("Command Flow 控制台")
+		self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+		self.setWindowFlag(Qt.WindowType.Tool)
+		self.setWindowModality(Qt.WindowModality.NonModal)
+		self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+		self.setFixedWidth(260)
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(16, 16, 16, 16)
+		layout.setSpacing(10)
+		label_cls = BodyLabel if HAVE_FLUENT_WIDGETS else QLabel
+		self._status_label = label_cls("已就绪", self)
+		self._status_label.setObjectName("quickPanelStatusLabel")
+		layout.addWidget(self._status_label)
+		self._file_label = label_cls("当前工作流: 未命名", self)
+		self._file_label.setObjectName("quickPanelFileLabel")
+		layout.addWidget(self._file_label)
+		button_cls = PrimaryPushButton if HAVE_FLUENT_WIDGETS else QPushButton
+		self.start_button = button_cls("启动工作流", self)
+		self.start_button.setCursor(Qt.CursorShape.PointingHandCursor)
+		self.start_button.clicked.connect(self._interface.execute_workflow)
+		layout.addWidget(self.start_button)
+		self.stop_button = button_cls("停止工作流", self)
+		self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
+		self.stop_button.clicked.connect(self._interface.stop_workflow)
+		self.stop_button.setEnabled(False)
+		layout.addWidget(self.stop_button)
+		self._status_label.setMinimumWidth(200)
+		self._update_style()
+
+	def closeEvent(self, event) -> None:  # noqa: D401
+		event.ignore()
+		self.hide()
+		self.exit_requested.emit()
+
+	def show_panel(self) -> None:
+		self._ensure_position()
+		self.show()
+		self.raise_()
+		self.activateWindow()
+
+	def set_running(self, running: bool) -> None:
+		self.start_button.setEnabled(not running)
+		self.stop_button.setEnabled(running)
+		self._status_label.setText("运行中" if running else "已就绪")
+
+	def update_file(self, filename: str, modified: bool) -> None:
+		suffix = "*" if modified else ""
+		self._file_label.setText(f"当前工作流: {filename}{suffix}")
+
+	def set_shortcut_hints(self, start_shortcut: str, stop_shortcut: str) -> None:
+		start_label = "启动工作流"
+		if start_shortcut:
+			start_label += f" ({start_shortcut})"
+		stop_label = "停止工作流"
+		if stop_shortcut:
+			stop_label += f" ({stop_shortcut})"
+		self.start_button.setToolTip(start_label)
+		self.stop_button.setToolTip(stop_label)
+
+	def _ensure_position(self) -> None:
+		screen = QApplication.primaryScreen()
+		if screen is None:
+			return
+		available = screen.availableGeometry()
+		self.adjustSize()
+		x_pos = available.right() - self.width() - 24
+		y_pos = available.bottom() - self.height() - 24
+		x_pos = max(available.left() + 16, x_pos)
+		y_pos = max(available.top() + 16, y_pos)
+		self.move(x_pos, y_pos)
+
+	def _update_style(self) -> None:
+		self.setStyleSheet(
+			"""
+			#quickPanelStatusLabel, #quickPanelFileLabel {
+				color: #ffffff;
+			}
+			"""
+		)
 
 
 class SettingsDialog(ConfigDialogBase):
@@ -1589,6 +1952,9 @@ class SettingsDialog(ConfigDialogBase):
 class WorkflowInterface(QWidget):
 	"""Workflow editor surface using Fluent UI components when available."""
 
+	run_state_changed = Signal(bool)
+	file_context_changed = Signal(str, bool)
+
 	def __init__(
 		self,
 		settings: SettingsManager,
@@ -1605,6 +1971,7 @@ class WorkflowInterface(QWidget):
 		self._last_directory = str(Path.home())
 		self._workflow_filter = "JSON Files (*.json);;All Files (*.*)"
 		self._window_base_title = "Command Flow Studio"
+		self._is_running = False
 
 		self.scene = WorkflowScene(self)
 		self.scene.message_posted.connect(self.append_log)
@@ -1668,6 +2035,17 @@ class WorkflowInterface(QWidget):
 		self.run_button.setMinimumHeight(40)
 		right_layout.addWidget(self.run_button)
 		self._button_map["run_workflow"] = self.run_button
+		self.stop_button = PrimaryPushButton("停止运行", right_panel)
+		self.stop_button.clicked.connect(self.stop_workflow)
+		self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
+		self.stop_button.setMinimumHeight(36)
+		self.stop_button.setEnabled(False)
+		right_layout.addWidget(self.stop_button)
+		self._button_map["stop_workflow"] = self.stop_button
+		self.background_button = self._make_side_button("切换后台模式", right_panel)
+		self.background_button.clicked.connect(self.toggle_quick_panel)
+		right_layout.addWidget(self.background_button)
+		self._button_map["toggle_quick_panel"] = self.background_button
 		self.settings_button = self._make_side_button("设置", right_panel)
 		self.settings_button.clicked.connect(self._invoke_settings)
 		right_layout.addWidget(self.settings_button)
@@ -1734,13 +2112,14 @@ class WorkflowInterface(QWidget):
 			runtime_factory=lambda: PyAutoGuiRuntime(dpi_scale=self._dpi_scale),
 			parent=self,
 		)
-		self.runner.started.connect(lambda: self.append_log("开始执行工作流"))
-		self.runner.finished.connect(self.on_execution_finished)
+		self.runner.started.connect(self._on_runner_started)
+		self.runner.finished.connect(self._on_runner_finished)
 		self.scene.modified.connect(self.mark_workflow_modified)
 		self._create_actions()
 		self._settings.shortcuts_changed.connect(self.reload_shortcuts)
 		self.reload_shortcuts()
 		self.update_file_display()
+		self._set_running_state(False)
 
 	def _make_side_button(self, text: str, parent: QWidget) -> QPushButton:
 		button = QPushButton(text, parent)
@@ -1794,6 +2173,7 @@ class WorkflowInterface(QWidget):
 		filename = self._current_workflow_path.name if self._current_workflow_path else "未命名"
 		suffix = "*" if self._unsaved_changes else ""
 		self.file_label.setText(f"当前文件: {filename}{suffix}")
+		self.file_context_changed.emit(filename, self._unsaved_changes)
 		self.delete_workflow_button.setEnabled(self._current_workflow_path is not None)
 		self.update_window_title()
 
@@ -1988,6 +2368,9 @@ class WorkflowInterface(QWidget):
 		self.scene.handle_view_resize(QSizeF(self.view.viewport().size()))
 
 	def execute_workflow(self) -> None:
+		if self._is_running:
+			self.show_status("工作流正在执行中", 2000)
+			return
 		if not self.scene.graph.nodes:
 			show_information(self, "运行工作流", "请先添加节点")
 			return
@@ -2001,14 +2384,47 @@ class WorkflowInterface(QWidget):
 		except ExecutionError as exc:
 			show_warning(self, "拓扑错误", str(exc))
 			return
-		self.run_button.setEnabled(False)
 		self.runner.run()
 
-	def on_execution_finished(self, success: bool, message: str) -> None:
-		self.run_button.setEnabled(True)
-		self.append_log(message)
-		if not success:
+	def stop_workflow(self) -> None:
+		if not self._is_running:
+			self.show_status("当前没有正在运行的工作流", 2000)
+			return
+		self.runner.stop()
+		self.append_log("已请求停止工作流")
+
+	def _on_runner_started(self) -> None:
+		self._set_running_state(True)
+		self.append_log("开始执行工作流")
+
+	def _on_runner_finished(self, success: bool, message: str) -> None:
+		self._set_running_state(False)
+		if message:
+			self.append_log(message)
+		if not success and message != "执行已取消":
 			show_warning(self, "执行失败", message)
+		elif not success:
+			self.show_status(message, 3000)
+
+	def _set_running_state(self, running: bool) -> None:
+		self._is_running = running
+		self.run_button.setEnabled(not running)
+		self.stop_button.setEnabled(running)
+		run_action = self._actions.get("run_workflow")
+		if run_action is not None:
+			run_action.setEnabled(not running)
+		stop_action = self._actions.get("stop_workflow")
+		if stop_action is not None:
+			stop_action.setEnabled(running)
+		self.run_state_changed.emit(running)
+
+	def toggle_quick_panel(self) -> None:
+		window = self.window()
+		if window is None:
+			return
+		toggle = getattr(window, "toggle_quick_panel", None)
+		if callable(toggle):
+			toggle()
 
 	def show_status(self, message: str, timeout_ms: int = 0) -> None:
 		self.status_bar.showMessage(message, timeout_ms)
@@ -2029,12 +2445,14 @@ class WorkflowInterface(QWidget):
 			"save_workflow": ("保存工作流", self.save_workflow),
 			"save_as_workflow": ("另存工作流", self.save_workflow_as),
 			"run_workflow": ("运行工作流", self.execute_workflow),
+			"stop_workflow": ("停止工作流", self.stop_workflow),
 			"zoom_in": ("放大画布", self.handle_zoom_in),
 			"zoom_out": ("缩小画布", self.handle_zoom_out),
 			"zoom_reset": ("重置缩放", self.handle_zoom_reset),
 			"zoom_fit": ("适配视图", self.fit_workflow_to_nodes),
 			"clear_log": ("清空日志", self.clear_log),
 			"open_settings": ("打开设置", self._invoke_settings),
+			"toggle_quick_panel": ("切换后台面板", self.toggle_quick_panel),
 		}
 		for action_id, (text, handler) in action_specs.items():
 			action = QAction(text, self)
@@ -2133,6 +2551,7 @@ class MainWindow(BaseMainWindow):
 		self.setWindowTitle("Workflow Capture Studio")
 		self.resize(1200, 720)
 
+		self._background_mode = False
 		self.settings = SettingsManager()
 		self.workflow_interface = WorkflowInterface(self.settings, self.open_settings_dialog, self)
 		if HAVE_FLUENT_WIDGETS and isinstance(self, FluentWindow):
@@ -2154,6 +2573,21 @@ class MainWindow(BaseMainWindow):
 			self.setCentralWidget(self.workflow_interface)
 		self.workflow_interface.set_base_window_title(self.windowTitle())
 		self.settings.settings_changed.connect(self._notify_settings_updated)
+		self.quick_panel = QuickControlWindow(self.workflow_interface, self)
+		self.quick_panel.hide()
+		self.quick_panel.exit_requested.connect(self._exit_background_mode)
+		self.workflow_interface.run_state_changed.connect(self.quick_panel.set_running)
+		self.workflow_interface.file_context_changed.connect(self.quick_panel.update_file)
+		self.workflow_interface.update_file_display()
+		self.quick_panel.set_running(False)
+		self.hotkey_manager = GlobalHotkeyManager(self)
+		self.hotkey_manager.set_callback("toggle_quick_panel", self.toggle_quick_panel)
+		self.hotkey_manager.set_callback("run_workflow", self._trigger_run_hotkey)
+		self.hotkey_manager.set_callback("stop_workflow", self._trigger_stop_hotkey)
+		if self.hotkey_manager.is_available:
+			self.hotkey_manager.set_window(self)
+		self.settings.shortcuts_changed.connect(self._update_global_hotkeys)
+		self._update_global_hotkeys()
 
 	def open_settings_dialog(self) -> None:
 		dialog = SettingsDialog(self.settings, self)
@@ -2161,3 +2595,80 @@ class MainWindow(BaseMainWindow):
 
 	def _notify_settings_updated(self, _payload: Dict[str, object]) -> None:
 		self.workflow_interface.show_status("设置已更新", 2000)
+
+	def toggle_quick_panel(self) -> None:
+		if self._background_mode:
+			self._exit_background_mode()
+		else:
+			self._enter_background_mode()
+
+	def _enter_background_mode(self) -> None:
+		if self._background_mode:
+			if not self.quick_panel.isVisible():
+				self.quick_panel.show_panel()
+			return
+		self._background_mode = True
+		if self.hotkey_manager.is_available:
+			self.hotkey_manager.set_window(self.quick_panel)
+		self.quick_panel.show_panel()
+		self.workflow_interface.show_status("已切换到后台控制面板", 3000)
+		self.hide()
+
+	def _exit_background_mode(self) -> None:
+		if self.quick_panel.isVisible():
+			self.quick_panel.hide()
+		if self.hotkey_manager.is_available:
+			self.hotkey_manager.set_window(self)
+		if not self._background_mode:
+			self.showMaximized()
+			self.raise_()
+			self.activateWindow()
+			return
+		self._background_mode = False
+		self.showMaximized()
+		self.raise_()
+		self.activateWindow()
+		self.workflow_interface.show_status("已返回编辑界面", 3000)
+
+	def _trigger_run_hotkey(self) -> None:
+		self.workflow_interface.execute_workflow()
+
+	def _trigger_stop_hotkey(self) -> None:
+		self.workflow_interface.stop_workflow()
+
+	def _update_global_hotkeys(self, *_args, **_kwargs) -> None:
+		start_sequence = self.settings.get_shortcut("run_workflow")
+		stop_sequence = self.settings.get_shortcut("stop_workflow")
+		toggle_sequence = self.settings.get_shortcut("toggle_quick_panel")
+		self.quick_panel.set_shortcut_hints(start_sequence, stop_sequence)
+		if not self.hotkey_manager.is_available:
+			return
+		mapping = {
+			"toggle_quick_panel": toggle_sequence,
+			"run_workflow": start_sequence,
+			"stop_workflow": stop_sequence,
+		}
+		errors = self.hotkey_manager.update_hotkeys(mapping)
+		if errors:
+			parts = [f"{self.settings.get_shortcut_label(action)}: {reason}" for action, reason in errors.items()]
+			self.workflow_interface.show_status("全局快捷键注册失败: " + "; ".join(parts), 6000)
+
+	def showEvent(self, event) -> None:  # noqa: D401
+		super().showEvent(event)
+		if self._background_mode:
+			self._background_mode = False
+			if self.quick_panel.isVisible():
+				self.quick_panel.hide()
+			self.workflow_interface.show_status("已返回编辑界面", 3000)
+		if self.hotkey_manager.is_available:
+			self.winId()  # ensure window handle is created
+			self.hotkey_manager.set_window(self)
+			self._update_global_hotkeys()
+
+	def closeEvent(self, event) -> None:  # noqa: D401
+		if hasattr(self, "hotkey_manager"):
+			self.hotkey_manager.cleanup()
+		if hasattr(self, "quick_panel") and self.quick_panel.isVisible():
+			self.quick_panel.hide()
+		self._background_mode = False
+		super().closeEvent(event)

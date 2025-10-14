@@ -25,12 +25,14 @@ class SettingsManager(QObject):
 			"save_workflow": "Ctrl+S",
 			"save_as_workflow": "Ctrl+Shift+S",
 			"run_workflow": "F5",
+			"stop_workflow": "Shift+F5",
 			"zoom_in": "Ctrl++",
 			"zoom_out": "Ctrl+-",
 			"zoom_reset": "Ctrl+0",
 			"zoom_fit": "Ctrl+F",
 			"clear_log": "Ctrl+Shift+L",
 			"open_settings": "Ctrl+,",
+			"toggle_quick_panel": "Ctrl+Alt+H",
 		},
 		"general": {
 			"auto_save_before_run": False,
@@ -44,12 +46,14 @@ class SettingsManager(QObject):
 		"save_workflow": {"label": "保存工作流", "description": "将当前工作流保存到当前文件"},
 		"save_as_workflow": {"label": "另存工作流", "description": "保存为新的工作流文件"},
 		"run_workflow": {"label": "运行工作流", "description": "执行当前工作流"},
+		"stop_workflow": {"label": "停止工作流", "description": "停止当前正在执行的工作流"},
 		"zoom_in": {"label": "放大画布", "description": "放大工作流视图"},
 		"zoom_out": {"label": "缩小画布", "description": "缩小工作流视图"},
 		"zoom_reset": {"label": "重置缩放", "description": "重置工作流视图缩放"},
 		"zoom_fit": {"label": "适配视图", "description": "将视图自适应当前节点"},
 		"clear_log": {"label": "清空日志", "description": "清除执行日志输出"},
 		"open_settings": {"label": "打开设置", "description": "打开设置对话框"},
+		"toggle_quick_panel": {"label": "切换后台面板", "description": "显示或隐藏后台控制小窗口"},
 	}
 
 	GENERAL_METADATA: Dict[str, Dict[str, str]] = {

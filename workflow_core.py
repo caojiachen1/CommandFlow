@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple, cast
 
 
 class ExecutionError(RuntimeError):
@@ -1722,10 +1722,17 @@ class WorkflowExecutor:
     def __init__(self, runtime: AutomationRuntime) -> None:
         self.runtime = runtime
 
-    def run(self, graph: WorkflowGraph) -> ExecutionContext:
+    def run(
+        self,
+        graph: WorkflowGraph,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ExecutionContext:
         context = ExecutionContext()
         order = graph.topological_order()
         for node_id in order:
+            if should_stop is not None and should_stop():
+                raise ExecutionError("Execution cancelled")
             node = graph.nodes[node_id]
             try:
                 node.execute(context, self.runtime)
