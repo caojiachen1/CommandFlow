@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple, cast
 
+from window_utils import activate_window, find_window_by_title, is_window_valid
+
 
 class ExecutionError(RuntimeError):
     """Raised when a node fails to execute."""
@@ -1469,6 +1471,8 @@ class SwitchContextNode(WorkflowNodeModel):
     display_name = "切换窗口"
     category = "系统操作"
 
+    WINDOW_MODE = "window_activate"
+
     _MODE_CHOICES: Dict[str, Tuple[List[str], str]] = {
         "program_next": (["alt", "tab"], "切换到下一个程序"),
         "program_prev": (["alt", "shift", "tab"], "切换到上一个程序"),
@@ -1484,12 +1488,13 @@ class SwitchContextNode(WorkflowNodeModel):
             "repeat": 1,
             "interval": 0.12,
             "pause_between": 0.15,
+            "target_window": {"title": "", "hwnd": 0},
         }
 
     def validate_config(self) -> None:
         cfg = self.config
         mode = cfg.get("mode")
-        if mode not in self._MODE_CHOICES:
+        if mode not in self._MODE_CHOICES and mode != self.WINDOW_MODE:
             raise ValueError("无效的切换模式")
         repeat = cfg.get("repeat")
         if not isinstance(repeat, int) or repeat <= 0:
@@ -1498,6 +1503,22 @@ class SwitchContextNode(WorkflowNodeModel):
             value = cfg.get(key)
             if not isinstance(value, (int, float)) or value < 0:
                 raise ValueError(f"{key} 必须为非负数")
+        target_window = cfg.get("target_window", {"title": "", "hwnd": 0})
+        if isinstance(target_window, str):
+            target_window = {"title": target_window.strip(), "hwnd": 0}
+        elif isinstance(target_window, dict):
+            title_value = str(target_window.get("title", ""))
+            hwnd_value = target_window.get("hwnd", 0)
+            try:
+                hwnd_value = int(hwnd_value) if hwnd_value is not None else 0
+            except (TypeError, ValueError):
+                hwnd_value = 0
+            target_window = {"title": title_value.strip(), "hwnd": hwnd_value}
+        else:
+            raise ValueError("target_window 必须为字符串或字典")
+        if mode == self.WINDOW_MODE and not target_window["title"]:
+            raise ValueError("请选择要切换的窗口")
+        cfg["target_window"] = target_window
 
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -1512,7 +1533,14 @@ class SwitchContextNode(WorkflowNodeModel):
                     ("desktop_prev", "上一个桌面 (Win+Ctrl+←)"),
                     ("task_view", "任务视图 (Win+Tab)"),
                     ("show_desktop", "显示桌面 (Win+D)"),
+                    (self.WINDOW_MODE, "指定窗口"),
                 ],
+            },
+            {
+                "key": "target_window",
+                "label": "目标窗口",
+                "type": "window",
+                "placeholder": "选择或输入窗口标题",
             },
             {
                 "key": "repeat",
@@ -1541,7 +1569,37 @@ class SwitchContextNode(WorkflowNodeModel):
 
     def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:
         cfg = self.config
-        keys, description = self._MODE_CHOICES[cfg["mode"]]
+        mode = cfg["mode"]
+        if mode == self.WINDOW_MODE:
+            target = cfg.get("target_window", {"title": "", "hwnd": 0}) or {}
+            if isinstance(target, dict):
+                title = str(target.get("title", "")).strip()
+                hwnd_value = target.get("hwnd", 0)
+            else:
+                title = str(target).strip()
+                hwnd_value = 0
+            if not title:
+                raise ExecutionError("目标窗口未设置")
+            try:
+                hwnd_int = int(hwnd_value) if hwnd_value else 0
+            except (TypeError, ValueError):
+                hwnd_int = 0
+            chosen_hwnd = hwnd_int if hwnd_int and is_window_valid(hwnd_int) else 0
+            if chosen_hwnd == 0:
+                found_hwnd = find_window_by_title(title)
+                if found_hwnd is None:
+                    raise ExecutionError(f"未找到窗口: {title}")
+                chosen_hwnd = found_hwnd
+            if not activate_window(chosen_hwnd):
+                raise ExecutionError("窗口切换失败")
+            context.record(self.id, {
+                "mode": mode,
+                "title": title,
+                "hwnd": chosen_hwnd,
+            })
+            return
+
+        keys, description = self._MODE_CHOICES[mode]
         repeat = int(cfg.get("repeat", 1))
         press_interval = float(cfg.get("interval", 0.12))
         pause = float(cfg.get("pause_between", 0.15))

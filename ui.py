@@ -184,6 +184,7 @@ from workflow_core import (
 )
 
 from settings_manager import SettingsManager
+from window_utils import list_windows, is_window_valid
 
 
 def configure_windows_dpi() -> None:
@@ -1489,6 +1490,137 @@ class PathPicker(QWidget):
 			self._line_edit.setText(selected)
 
 
+class WindowPicker(QWidget):
+	"""Realtime window selector widget for workflow node configuration."""
+
+	REFRESH_INTERVAL_MS = 2000
+
+	def __init__(
+		self,
+		parent: Optional[QWidget] = None,
+		*,
+		initial: Any = None,
+		placeholder: str = "",
+	) -> None:
+		super().__init__(parent)
+		self._available = sys.platform == "win32"
+		self._selected_hwnd = 0
+		self._updating_text = False
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setSpacing(6)
+		line_edit_cls = FluentLineEdit if HAVE_FLUENT_WIDGETS else QLineEdit
+		self._line_edit = line_edit_cls(self)
+		if placeholder:
+			self._line_edit.setPlaceholderText(placeholder)
+		layout.addWidget(self._line_edit)
+		controls = QHBoxLayout()
+		controls.setContentsMargins(0, 0, 0, 0)
+		controls.setSpacing(6)
+		self._status_label = QLabel("正在监控窗口...", self)
+		self._status_label.setStyleSheet("color: #969696; font-size: 11px;")
+		controls.addWidget(self._status_label)
+		controls.addStretch(1)
+		button_cls = PrimaryPushButton if HAVE_FLUENT_WIDGETS else QPushButton
+		self._refresh_button = button_cls("刷新", self)
+		self._refresh_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+		self._refresh_button.clicked.connect(self.refresh_list)
+		controls.addWidget(self._refresh_button)
+		layout.addLayout(controls)
+		self._list_widget = QListWidget(self)
+		self._list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+		self._list_widget.setMinimumHeight(170)
+		layout.addWidget(self._list_widget)
+		if hasattr(self._line_edit, "textEdited"):
+			self._line_edit.textEdited.connect(self._on_text_edited)
+		else:  # pragma: no cover - fallback
+			self._line_edit.textChanged.connect(self._on_text_edited)
+		self._list_widget.itemSelectionChanged.connect(self._on_selection_changed)
+		self._timer = QTimer(self)
+		self._timer.setInterval(self.REFRESH_INTERVAL_MS)
+		self._timer.timeout.connect(self.refresh_list)
+		self._apply_initial(initial)
+		if self._available:
+			self.refresh_list()
+			self._timer.start()
+		else:
+			self._status_label.setText("窗口监控仅在 Windows 上可用")
+			self._refresh_button.setEnabled(False)
+			placeholder_item = QListWidgetItem("当前平台不支持窗口枚举")
+			placeholder_item.setFlags(Qt.ItemFlag.NoItemFlags)
+			self._list_widget.addItem(placeholder_item)
+
+	def _apply_initial(self, initial: Any) -> None:
+		title = ""
+		hwnd_value = 0
+		if isinstance(initial, dict):
+			title = str(initial.get("title", ""))
+			try:
+				hwnd_value = int(initial.get("hwnd", 0) or 0)
+			except (TypeError, ValueError):
+				hwnd_value = 0
+		elif isinstance(initial, str):
+			title = initial
+		self._line_edit.setText(title)
+		self._selected_hwnd = hwnd_value if hwnd_value and is_window_valid(hwnd_value) else 0
+
+	def refresh_list(self) -> None:
+		if not self._available:
+			return
+		windows = list_windows()
+		current_title = self._line_edit.text().strip().lower()
+		current_hwnd = self._selected_hwnd if is_window_valid(self._selected_hwnd) else 0
+		self._list_widget.blockSignals(True)
+		self._list_widget.clear()
+		for window in windows:
+			title = str(window.get("title", ""))
+			hwnd = int(window.get("hwnd", 0) or 0)
+			label = title
+			if window.get("is_minimized"):
+				label += " (已最小化)"
+			label += f"  [0x{hwnd:08X}]"
+			item = QListWidgetItem(label)
+			item.setData(Qt.ItemDataRole.UserRole, {"title": title, "hwnd": hwnd})
+			self._list_widget.addItem(item)
+			if current_hwnd and hwnd == current_hwnd:
+				item.setSelected(True)
+		if not self._list_widget.selectedItems() and current_title:
+			for index in range(self._list_widget.count()):
+				item = self._list_widget.item(index)
+				data = item.data(Qt.ItemDataRole.UserRole) or {}
+				if str(data.get("title", "")).strip().lower() == current_title:
+					item.setSelected(True)
+					break
+		self._list_widget.blockSignals(False)
+		self._status_label.setText(f"监控窗口数: {len(windows)}")
+
+	def _on_selection_changed(self) -> None:
+		items = self._list_widget.selectedItems()
+		if not items:
+			return
+		data = items[0].data(Qt.ItemDataRole.UserRole) or {}
+		title = str(data.get("title", ""))
+		try:
+			hwnd_value = int(data.get("hwnd", 0) or 0)
+		except (TypeError, ValueError):
+			hwnd_value = 0
+		self._selected_hwnd = hwnd_value if hwnd_value else 0
+		self._updating_text = True
+		self._line_edit.setText(title)
+		self._updating_text = False
+
+	def _on_text_edited(self, _text: str) -> None:
+		if self._updating_text:
+			return
+		self._selected_hwnd = 0
+
+	def value(self) -> Dict[str, Any]:
+		return {
+			"title": self._line_edit.text().strip(),
+			"hwnd": int(self._selected_hwnd) if self._selected_hwnd else 0,
+		}
+
+
 class ConfigDialog(ConfigDialogBase):
 	"""Generic configuration dialog built from a node schema."""
 
@@ -1553,6 +1685,13 @@ class ConfigDialog(ConfigDialogBase):
 				name_filter=cast(str, field.get("name_filter", "All Files (*.*)")),
 				placeholder=cast(str, field.get("placeholder", "")),
 				start_directory=cast(str, field.get("start_directory", "")),
+			)
+			return picker
+		if ftype == "window":
+			picker = WindowPicker(
+				self,
+				initial=value,
+				placeholder=cast(str, field.get("placeholder", "")),
 			)
 			return picker
 		if ftype == "bool":
@@ -1630,6 +1769,8 @@ class ConfigDialog(ConfigDialogBase):
 					else:
 						data = text_value
 				result[key] = data
+			elif isinstance(widget, WindowPicker):
+				result[key] = widget.value()
 			elif isinstance(widget, (FluentTextEdit, QTextEdit)):
 				result[key] = widget.toPlainText()
 			elif isinstance(widget, (FluentLineEdit, QLineEdit)):
