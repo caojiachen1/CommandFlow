@@ -261,6 +261,11 @@ class WorkflowNodeModel:
 
         return ["继续"]
 
+    def input_ports(self) -> List[str]:
+        """Return display labels for each input port."""
+
+        return ["执行"]
+
     def determine_next(
         self,
         graph: "WorkflowGraph",
@@ -1888,13 +1893,25 @@ class CommandNode(WorkflowNodeModel):
         return result
 
 
+class ConditionNodeBase(WorkflowNodeModel):
+    """Base class for reusable condition evaluation nodes."""
+
+    category = "条件判断"
+
+    def output_ports(self) -> List[str]:
+        return ["下一步", "条件结果"]
+
+
 class IfConditionNode(WorkflowNodeModel):
     type_name = "if_condition"
     display_name = "条件判断"
-    category = "控制流"
+    category = "流程控制"
 
     def default_config(self) -> Dict[str, Any]:
         return {"expression": "True"}
+
+    def input_ports(self) -> List[str]:
+        return ["执行", "条件"]
 
     def output_ports(self) -> List[str]:
         return ["条件成立", "条件不成立"]
@@ -1904,8 +1921,6 @@ class IfConditionNode(WorkflowNodeModel):
         if not isinstance(expression, str):
             raise ValueError("表达式必须是字符串")
         expr = expression.strip()
-        if not expr:
-            raise ValueError("条件表达式不能为空")
         self.config["expression"] = expr
 
     def config_schema(self) -> List[Dict[str, Any]]:
@@ -1917,27 +1932,208 @@ class IfConditionNode(WorkflowNodeModel):
             }
         ]
 
-    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> bool:  # noqa: ARG002
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> None:  # noqa: ARG002
+        # 实际的条件判断在 ``determine_next`` 中完成
+        context.record(self.id, {})
+
+    def _evaluate_condition(
+        self,
+        graph: "WorkflowGraph",
+        context: ExecutionContext,
+    ) -> Tuple[bool, Any, Optional[str]]:
+        incoming = graph.get_incoming_edge(self.id, target_port=1)
+        if incoming is not None:
+            source_state = context.get(incoming.source)
+            if source_state is None:
+                raise ExecutionError("条件输入尚未执行")
+            raw_value = None
+            if isinstance(source_state, dict) and "condition" in source_state:
+                raw_value = source_state.get("value", source_state["condition"])
+                result = bool(source_state["condition"])
+            else:
+                raw_value = source_state
+                result = bool(source_state)
+            return result, raw_value, incoming.source
         expression = self.config["expression"]
-        result = evaluate_expression(expression, context)
-        condition = bool(result)
-        context.record(self.id, {"condition": condition, "value": result})
-        return condition
+        raw_value = evaluate_expression(expression, context)
+        return bool(raw_value), raw_value, None
 
     def determine_next(
         self,
         graph: "WorkflowGraph",
         context: ExecutionContext,
     ) -> Optional[str]:
-        state = context.get(self.id)
-        condition = False
-        if isinstance(state, dict):
-            condition = bool(state.get("condition"))
-        elif isinstance(state, bool):
-            condition = state
-        if condition:
+        result, raw_value, source = self._evaluate_condition(graph, context)
+        context.record(
+            self.id,
+            {
+                "condition": result,
+                "value": raw_value,
+                "source": source,
+            },
+        )
+        if result:
             return graph.get_outgoing_target(self.id, 0)
         return graph.get_outgoing_target(self.id, 1)
+
+
+class BinaryExpressionConditionNode(ConditionNodeBase):
+    """Condition node that evaluates two expressions and compares them."""
+
+    left_key = "left_expression"
+    right_key = "right_expression"
+    left_label = "左侧表达式"
+    right_label = "右侧表达式"
+    default_left_expression = "0"
+    default_right_expression = "0"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            self.left_key: self.default_left_expression,
+            self.right_key: self.default_right_expression,
+        }
+
+    def validate_config(self) -> None:
+        for key in (self.left_key, self.right_key):
+            value = self.config.get(key, "")
+            if not isinstance(value, str):
+                raise ValueError(f"{key} 必须是字符串表达式")
+            expr = value.strip()
+            if not expr:
+                raise ValueError(f"{key} 表达式不能为空")
+            self.config[key] = expr
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": self.left_key,
+                "label": self.left_label,
+                "type": "multiline",
+            },
+            {
+                "key": self.right_key,
+                "label": self.right_label,
+                "type": "multiline",
+            },
+        ]
+
+    def _evaluate_operand(
+        self,
+        expression_key: str,
+        context: ExecutionContext,
+    ) -> Any:
+        expression = self.config[expression_key]
+        try:
+            return evaluate_expression(expression, context)
+        except ExecutionError:
+            raise
+        except Exception as exc:  # pragma: no cover - safeguard
+            raise ExecutionError(f"计算表达式失败: {expression}") from exc
+
+    def transform_operands(self, left: Any, right: Any) -> Tuple[Any, Any]:
+        return left, right
+
+    def compare(self, left: Any, right: Any) -> bool:
+        raise NotImplementedError
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> bool:  # noqa: ARG002
+        left_value = self._evaluate_operand(self.left_key, context)
+        right_value = self._evaluate_operand(self.right_key, context)
+        try:
+            operand_left, operand_right = self.transform_operands(left_value, right_value)
+            result = bool(self.compare(operand_left, operand_right))
+        except ExecutionError:
+            raise
+        except Exception as exc:  # pragma: no cover - conversion guard
+            raise ExecutionError(f"条件比较失败: {exc}") from exc
+        context.record(
+            self.id,
+            {
+                "condition": result,
+                "left": operand_left,
+                "right": operand_right,
+                "value": result,
+            },
+        )
+        return result
+
+
+class NumericComparisonConditionNode(BinaryExpressionConditionNode):
+    """Condition node that compares numeric operands."""
+
+    default_left_expression = "0"
+    default_right_expression = "0"
+
+    def transform_operands(self, left: Any, right: Any) -> Tuple[float, float]:
+        try:
+            left_num = float(left)
+            right_num = float(right)
+        except (TypeError, ValueError) as exc:
+            raise ExecutionError("数值比较需要可转换为数字的结果") from exc
+        return left_num, right_num
+
+
+class EqualsConditionNode(BinaryExpressionConditionNode):
+    type_name = "condition_equals"
+    display_name = "判断等于"
+
+    def compare(self, left: Any, right: Any) -> bool:
+        return left == right
+
+
+class NotEqualsConditionNode(BinaryExpressionConditionNode):
+    type_name = "condition_not_equals"
+    display_name = "判断不等于"
+
+    def compare(self, left: Any, right: Any) -> bool:
+        return left != right
+
+
+class GreaterThanConditionNode(NumericComparisonConditionNode):
+    type_name = "condition_greater_than"
+    display_name = "判断大于"
+
+    def compare(self, left: float, right: float) -> bool:
+        return left > right
+
+
+class GreaterOrEqualConditionNode(NumericComparisonConditionNode):
+    type_name = "condition_greater_or_equal"
+    display_name = "判断大于等于"
+
+    def compare(self, left: float, right: float) -> bool:
+        return left >= right
+
+
+class LessThanConditionNode(NumericComparisonConditionNode):
+    type_name = "condition_less_than"
+    display_name = "判断小于"
+
+    def compare(self, left: float, right: float) -> bool:
+        return left < right
+
+
+class LessOrEqualConditionNode(NumericComparisonConditionNode):
+    type_name = "condition_less_or_equal"
+    display_name = "判断小于等于"
+
+    def compare(self, left: float, right: float) -> bool:
+        return left <= right
+
+
+class ContainsConditionNode(BinaryExpressionConditionNode):
+    type_name = "condition_contains"
+    display_name = "判断包含"
+    default_left_expression = "[]"
+    default_right_expression = "0"
+    left_label = "容器表达式"
+    right_label = "待检查表达式"
+
+    def compare(self, left: Any, right: Any) -> bool:
+        try:
+            return right in left
+        except TypeError as exc:
+            raise ExecutionError("包含判断需要可迭代或字符串类型的左侧表达式") from exc
 
 
 class WhileLoopNode(WorkflowNodeModel):
@@ -2167,6 +2363,13 @@ NODE_REGISTRY = {
     CommandNode.type_name: CommandNode,
     SwitchContextNode.type_name: SwitchContextNode,
     IfConditionNode.type_name: IfConditionNode,
+    EqualsConditionNode.type_name: EqualsConditionNode,
+    NotEqualsConditionNode.type_name: NotEqualsConditionNode,
+    GreaterThanConditionNode.type_name: GreaterThanConditionNode,
+    GreaterOrEqualConditionNode.type_name: GreaterOrEqualConditionNode,
+    LessThanConditionNode.type_name: LessThanConditionNode,
+    LessOrEqualConditionNode.type_name: LessOrEqualConditionNode,
+    ContainsConditionNode.type_name: ContainsConditionNode,
     WhileLoopNode.type_name: WhileLoopNode,
     ForLoopNode.type_name: ForLoopNode,
 }
@@ -2175,7 +2378,15 @@ NODE_REGISTRY = {
 @dataclass(frozen=True)
 class OutgoingEdge:
     target: str
-    port_index: int
+    source_port: int
+    target_port: int
+
+
+@dataclass(frozen=True)
+class IncomingEdge:
+    source: str
+    target_port: int
+    source_port: int
 
 
 class WorkflowGraph:
@@ -2184,7 +2395,7 @@ class WorkflowGraph:
     def __init__(self) -> None:
         self.nodes: Dict[str, WorkflowNodeModel] = {}
         self.edges: Dict[str, List[OutgoingEdge]] = {}
-        self.reverse_edges: Dict[str, List[str]] = {}
+        self.reverse_edges: Dict[str, List[IncomingEdge]] = {}
 
     def add_node(self, node: WorkflowNodeModel) -> None:
         if node.id in self.nodes:
@@ -2196,62 +2407,114 @@ class WorkflowGraph:
     def remove_node(self, node_id: str) -> None:
         if node_id not in self.nodes:
             return
-        for upstream in list(self.reverse_edges[node_id]):
-            self.remove_edge(upstream, node_id)
+        for incoming in list(self.reverse_edges[node_id]):
+            self.remove_edge(
+                incoming.source,
+                node_id,
+                source_port=incoming.source_port,
+                target_port=incoming.target_port,
+            )
         for edge in list(self.edges[node_id]):
-            self.remove_edge(node_id, edge.target, edge.port_index)
+            self.remove_edge(
+                node_id,
+                edge.target,
+                source_port=edge.source_port,
+                target_port=edge.target_port,
+            )
         del self.nodes[node_id]
         del self.edges[node_id]
         del self.reverse_edges[node_id]
 
-    def add_edge(self, source_id: str, target_id: str, *, source_port: int = 0) -> None:
+    def add_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        *,
+        source_port: int = 0,
+        target_port: int = 0,
+    ) -> None:
         if source_id == target_id:
             raise ValueError("Cannot connect node to itself")
         if source_id not in self.nodes or target_id not in self.nodes:
             raise ValueError("Both nodes must exist")
-        node = self.nodes[source_id]
-        port_labels = node.output_ports()
-        if not port_labels:
-            raise ValueError(f"节点 {node.title} 不支持输出连接")
-        if source_port < 0 or source_port >= len(port_labels):
+        source_node = self.nodes[source_id]
+        target_node = self.nodes[target_id]
+        source_ports = source_node.output_ports()
+        target_ports = target_node.input_ports()
+        if not source_ports:
+            raise ValueError(f"节点 {source_node.title} 不支持输出连接")
+        if source_port < 0 or source_port >= len(source_ports):
             raise ValueError(
-                f"节点 {node.title} 的输出端口索引无效: {source_port}"
+                f"节点 {source_node.title} 的输出端口索引无效: {source_port}"
             )
-        for edge in self.edges[source_id]:
-            if edge.port_index == source_port:
+        if target_port < 0 or target_port >= len(target_ports):
+            raise ValueError(
+                f"节点 {target_node.title} 的输入端口索引无效: {target_port}"
+            )
+        if isinstance(target_node, IfConditionNode) and target_port == 1:
+            if not isinstance(source_node, ConditionNodeBase) or source_port != 1:
                 raise ValueError(
-                    f"节点 {node.title} 的输出端口 '{port_labels[source_port]}' 已连接，不能重复连接"
+                    f"节点 {target_node.title} 的条件输入只能连接条件判断节点的结果端口"
                 )
-        self.edges[source_id].append(OutgoingEdge(target_id, source_port))
-        if source_id not in self.reverse_edges[target_id]:
-            self.reverse_edges[target_id].append(source_id)
+        if isinstance(source_node, ConditionNodeBase) and source_port == 1:
+            if not isinstance(target_node, IfConditionNode) or target_port != 1:
+                raise ValueError(
+                    f"节点 {source_node.title} 的条件结果端口只能连接到条件判断控件的条件输入"
+                )
+        for edge in self.edges[source_id]:
+            if edge.source_port == source_port and edge.target_port == target_port and edge.target == target_id:
+                raise ValueError("连接已存在")
+            if edge.source_port == source_port:
+                raise ValueError(
+                    f"节点 {source_node.title} 的输出端口 '{source_ports[source_port]}' 已连接，不能重复连接"
+                )
+        for incoming in self.reverse_edges[target_id]:
+            if incoming.target_port == target_port:
+                raise ValueError(
+                    f"节点 {target_node.title} 的输入端口 '{target_ports[target_port]}' 已连接"
+                )
+        new_edge = OutgoingEdge(target_id, source_port, target_port)
+        self.edges[source_id].append(new_edge)
+        self.reverse_edges[target_id].append(
+            IncomingEdge(source_id, target_port, source_port)
+        )
 
     def remove_edge(
         self,
         source_id: str,
         target_id: str,
+        *,
         source_port: int | None = None,
+        target_port: int | None = None,
     ) -> None:
         if source_id not in self.edges:
             return
         removed = False
         remaining: List[OutgoingEdge] = []
         for edge in self.edges[source_id]:
-            if edge.target == target_id and (
-                source_port is None or edge.port_index == source_port
-            ):
+            matches_source = source_port is None or edge.source_port == source_port
+            matches_target = target_port is None or edge.target_port == target_port
+            if edge.target == target_id and matches_source and matches_target:
                 removed = True
                 continue
             remaining.append(edge)
         self.edges[source_id] = remaining
         if removed and target_id in self.reverse_edges:
-            if source_id in self.reverse_edges[target_id]:
-                self.reverse_edges[target_id].remove(source_id)
+            filtered: List[IncomingEdge] = []
+            for incoming in self.reverse_edges[target_id]:
+                matches_source = source_port is None or incoming.source_port == source_port
+                matches_target = target_port is None or incoming.target_port == target_port
+                if incoming.source == source_id and matches_source and matches_target:
+                    continue
+                filtered.append(incoming)
+            self.reverse_edges[target_id] = filtered
 
     def entry_nodes(self) -> List[str]:
-        return sorted(
-            node_id for node_id, parents in self.reverse_edges.items() if not parents
-        )
+        entries: List[str] = []
+        for node_id, incoming in self.reverse_edges.items():
+            if not any(edge.target_port == 0 for edge in incoming):
+                entries.append(node_id)
+        return sorted(entries)
 
     def validate(self) -> None:
         if not self.nodes:
@@ -2272,6 +2535,8 @@ class WorkflowGraph:
                 continue
             reachable.add(current)
             for edge in self.edges.get(current, []):
+                if edge.target_port != 0:
+                    continue
                 stack.append(edge.target)
         if len(reachable) != len(self.nodes):
             unreachable = sorted(set(self.nodes) - reachable)
@@ -2282,22 +2547,45 @@ class WorkflowGraph:
             port_labels = node.output_ports()
             if not port_labels:
                 continue
-            mapped: Dict[int, OutgoingEdge] = {}
+            mapped: Dict[int, List[OutgoingEdge]] = {}
             for edge in self.edges.get(node_id, []):
-                if edge.port_index >= len(port_labels):
+                mapped.setdefault(edge.source_port, []).append(edge)
+                if edge.source_port >= len(port_labels):
                     raise ExecutionError(
-                        f"节点 {node.title} 的连接数据无效: 端口索引 {edge.port_index} 超出范围"
+                        f"节点 {node.title} 的连接数据无效: 端口索引 {edge.source_port} 超出范围"
                     )
-                if edge.port_index in mapped:
-                    raise ExecutionError(
-                        f"节点 {node.title} 的输出端口 '{port_labels[edge.port_index]}' 存在多个连接"
-                    )
-                mapped[edge.port_index] = edge
-            if isinstance(node, IfConditionNode):
+            if isinstance(node, ConditionNodeBase):
                 for idx, label in enumerate(port_labels):
-                    if idx not in mapped:
+                    edges_for_port = mapped.get(idx, [])
+                    if not edges_for_port:
                         raise ExecutionError(
                             f"{node.title} 的输出端口 '{label}' 未连接"
+                        )
+                    if len(edges_for_port) > 1:
+                        raise ExecutionError(
+                            f"{node.title} 的输出端口 '{label}' 只能连接一个目标"
+                        )
+                    if idx == 0 and edges_for_port[0].target_port != 0:
+                        raise ExecutionError(
+                            f"{node.title} 的输出端口 '{label}' 必须连接到执行输入端口"
+                        )
+                    if idx == 1 and edges_for_port[0].target_port == 0:
+                        raise ExecutionError(
+                            f"{node.title} 的条件结果输出必须连接到条件输入端口"
+                        )
+            elif isinstance(node, IfConditionNode):
+                condition_edge = self.get_incoming_edge(node_id, target_port=1)
+                if condition_edge is None and not node.config.get("expression"):
+                    raise ExecutionError(f"{node.title} 缺少条件输入或表达式配置")
+                if condition_edge is not None:
+                    source_node = self.nodes.get(condition_edge.source)
+                    if source_node is None or not isinstance(source_node, ConditionNodeBase):
+                        raise ExecutionError(
+                            f"{node.title} 的条件输入必须来自条件判断节点"
+                        )
+                    if condition_edge.source_port != 1:
+                        raise ExecutionError(
+                            f"{node.title} 的条件输入必须连接条件节点的结果端口"
                         )
             elif isinstance(node, (WhileLoopNode, ForLoopNode)):
                 required_ports = {
@@ -2305,11 +2593,20 @@ class WorkflowGraph:
                     2: port_labels[2],
                 }
                 for idx, label in required_ports.items():
-                    if idx not in mapped:
+                    edges_for_port = mapped.get(idx)
+                    if not edges_for_port:
                         raise ExecutionError(
                             f"{node.title} 的输出端口 '{label}' 未连接"
                         )
-                tail_edge = mapped[2]
+                    if len(edges_for_port) > 1:
+                        raise ExecutionError(
+                            f"{node.title} 的输出端口 '{label}' 只能连接一个目标"
+                        )
+                    if edges_for_port[0].target_port != 0:
+                        raise ExecutionError(
+                            f"{node.title} 的输出端口 '{label}' 必须连接到执行输入端口"
+                        )
+                tail_edge = mapped[2][0]
                 tail_target = tail_edge.target
                 if tail_target == node_id:
                     raise ExecutionError(
@@ -2332,7 +2629,8 @@ class WorkflowGraph:
                     )
                 loop_tail_sources[tail_target] = node_id
             else:
-                if len(mapped) > 1:
+                control_edges = [edge for edges in mapped.values() for edge in edges if edge.target_port == 0]
+                if len(control_edges) > 1:
                     raise ExecutionError(
                         f"{node.title} 只能连接到一个后续节点，如需分支请使用条件节点"
                     )
@@ -2345,14 +2643,18 @@ class WorkflowGraph:
         return False
 
     def topological_order(self) -> List[str]:
-        indegree = {node_id: len(deps) for node_id, deps in self.reverse_edges.items()}
+        indegree: Dict[str, int] = {}
+        for node_id, incoming in self.reverse_edges.items():
+            indegree[node_id] = sum(1 for edge in incoming if edge.target_port == 0)
         queue = [node for node, degree in indegree.items() if degree == 0]
         order: List[str] = []
         tmp_indegree = indegree.copy()
         while queue:
             current = queue.pop(0)
             order.append(current)
-            for edge in self.edges[current]:
+            for edge in self.edges.get(current, []):
+                if edge.target_port != 0:
+                    continue
                 neighbor = edge.target
                 tmp_indegree[neighbor] -= 1
                 if tmp_indegree[neighbor] == 0:
@@ -2368,9 +2670,12 @@ class WorkflowGraph:
             graph.add_node(node_cls(node.id, node.title, node.config.copy()))
         for source, targets in self.edges.items():
             for edge in targets:
-                graph.edges[source].append(OutgoingEdge(edge.target, edge.port_index))
-                if source not in graph.reverse_edges[edge.target]:
-                    graph.reverse_edges[edge.target].append(source)
+                graph.edges[source].append(
+                    OutgoingEdge(edge.target, edge.source_port, edge.target_port)
+                )
+                graph.reverse_edges[edge.target].append(
+                    IncomingEdge(source, edge.target_port, edge.source_port)
+                )
         return graph
 
     def build_loop_back_map(self) -> Dict[str, str]:
@@ -2379,14 +2684,31 @@ class WorkflowGraph:
             if not isinstance(node, (WhileLoopNode, ForLoopNode)):
                 continue
             for edge in self.edges.get(node_id, []):
-                if edge.port_index == 2:
+                if edge.source_port == 2 and edge.target_port == 0:
                     mapping[edge.target] = node_id
         return mapping
 
-    def get_outgoing_target(self, node_id: str, port_index: int) -> Optional[str]:
+    def get_outgoing_target(
+        self,
+        node_id: str,
+        port_index: int,
+        *,
+        target_port: int = 0,
+    ) -> Optional[str]:
         for edge in self.edges.get(node_id, []):
-            if edge.port_index == port_index:
+            if edge.source_port == port_index and edge.target_port == target_port:
                 return edge.target
+        return None
+
+    def get_incoming_edge(
+        self,
+        node_id: str,
+        *,
+        target_port: int,
+    ) -> Optional[IncomingEdge]:
+        for edge in self.reverse_edges.get(node_id, []):
+            if edge.target_port == target_port:
+                return edge
         return None
 
 

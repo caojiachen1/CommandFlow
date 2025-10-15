@@ -175,8 +175,10 @@ INFOBAR_AVAILABLE = HAVE_FLUENT_WIDGETS and InfoBar is not None and InfoBarPosit
 
 from workflow_core import (
 	AutomationRuntime,
+	ConditionNodeBase,
 	ExecutionError,
 	ForLoopNode,
+	IfConditionNode,
 	WhileLoopNode,
 	WorkflowExecutor,
 	WorkflowGraph,
@@ -421,6 +423,7 @@ class NodePalette(QListWidget):
 		"键盘操作",
 		"图像识别",
 		"流程控制",
+		"条件判断",
 		"系统操作",
 		"其他",
 	)
@@ -887,7 +890,11 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.title_item.setDefaultTextColor(QColor(220, 220, 220))
 		self.title_item.setPos(20, 14)
 		self.title_item.setZValue(1)
-		self.input_port = NodePort(self, "input", 0, "输入")
+		self.input_ports: List[NodePort] = []
+		for idx, label in enumerate(node_model.input_ports()):
+			port = NodePort(self, "input", idx, label)
+			self.input_ports.append(port)
+		self.input_port = self.input_ports[0] if self.input_ports else None
 		self.output_ports: List[NodePort] = []
 		for idx, label in enumerate(node_model.output_ports()):
 			port = NodePort(self, "output", idx, label)
@@ -895,13 +902,17 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.update_ports()
 
 	def update_ports(self) -> None:
-		self.input_port.setPos(1, self.HEIGHT / 2 - 6)
-		count = len(self.output_ports)
-		if count == 0:
+		if self.input_ports:
+			spacing_in = self.HEIGHT / (len(self.input_ports) + 1)
+			for offset, port in enumerate(self.input_ports, start=1):
+				y_pos = spacing_in * offset - 6
+				port.setPos(1, y_pos)
+		count_out = len(self.output_ports)
+		if count_out == 0:
 			return
-		spacing = self.HEIGHT / (count + 1)
+		spacing_out = self.HEIGHT / (count_out + 1)
 		for offset, port in enumerate(self.output_ports, start=1):
-			y_pos = spacing * offset - 6
+			y_pos = spacing_out * offset - 6
 			port.setPos(self.WIDTH - 1, y_pos)
 
 	def set_title(self, title: str) -> None:
@@ -922,6 +933,11 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		if index < 0 or index >= len(self.output_ports):
 			raise IndexError("output port index out of range")
 		return self.output_ports[index]
+
+	def get_input_port(self, index: int) -> NodePort:
+		if index < 0 or index >= len(self.input_ports):
+			raise IndexError("input port index out of range")
+		return self.input_ports[index]
 
 	@property
 	def primary_output_port(self) -> NodePort:
@@ -1197,8 +1213,7 @@ class WorkflowScene(QGraphicsScene):
 				for port in item.output_ports:
 					if port is source_port:
 						continue
-					parent = port.parentItem()
-					if parent is source_port.parentItem():
+					if not self._can_connect_ports(source_port, port):
 						continue
 					identifier = id(port)
 					if identifier in seen:
@@ -1206,27 +1221,36 @@ class WorkflowScene(QGraphicsScene):
 					ports.append(port)
 					seen.add(identifier)
 		for item in self.node_items.values():
-			candidate = item.input_port
-			if candidate is source_port:
-				continue
-			if candidate.parentItem() is source_port.parentItem():
-				continue
-			identifier = id(candidate)
-			if identifier in seen:
-				continue
-			ports.append(candidate)
-			seen.add(identifier)
+			for candidate in item.input_ports:
+				if candidate is source_port:
+					continue
+				if not self._can_connect_ports(source_port, candidate):
+					continue
+				identifier = id(candidate)
+				if identifier in seen:
+					continue
+				ports.append(candidate)
+				seen.add(identifier)
 		return ports
 
 	def _can_connect_ports(self, source_port: NodePort, target_port: NodePort) -> bool:
+		source_item = cast(WorkflowNodeItem, source_port.parentItem())
+		target_item = cast(WorkflowNodeItem, target_port.parentItem())
+		if source_port.kind != "output" or target_item is source_item:
+			return False
 		if target_port.kind == "input":
-			return target_port is not source_port and target_port.parentItem() is not source_port.parentItem()
+			if isinstance(target_item.node_model, IfConditionNode) and target_port.port_index == 1:
+				return (
+					isinstance(source_item.node_model, ConditionNodeBase)
+					and source_port.port_index == 1
+				)
+			if isinstance(source_item.node_model, ConditionNodeBase) and source_port.port_index == 1:
+				return False
+			return target_port is not source_port
 		if target_port.kind == "output":
-			return (
-				self._is_loop_tail_port(source_port)
-				and target_port is not source_port
-				and target_port.parentItem() is not source_port.parentItem()
-			)
+			if isinstance(source_item.node_model, ConditionNodeBase) and source_port.port_index == 1:
+				return False
+			return self._is_loop_tail_port(source_port) and target_item is not source_item
 		return False
 
 	def handle_port_press(self, port: NodePort) -> None:
@@ -1297,6 +1321,7 @@ class WorkflowScene(QGraphicsScene):
 					source_node,
 					target_node,
 					source_port=source_port.port_index,
+					target_port=target_port.port_index,
 				)
 				self.removeItem(item)
 				if item in self.connections:
@@ -1318,6 +1343,7 @@ class WorkflowScene(QGraphicsScene):
 				source_node,
 				target_node,
 				source_port=source_port.port_index,
+				target_port=target_port.port_index,
 			)
 		except ValueError as exc:
 			self.message_posted.emit(str(exc))
@@ -1439,6 +1465,7 @@ class WorkflowScene(QGraphicsScene):
 			source,
 			target,
 			source_port=cast(NodePort, connection.source).port_index,
+			target_port=cast(NodePort, connection.target).port_index,
 		)
 		self.removeItem(connection)
 		if connection in self.connections:
@@ -1506,7 +1533,8 @@ class WorkflowScene(QGraphicsScene):
 					{
 						"source": source,
 						"target": edge.target,
-						"source_port": edge.port_index,
+						"source_port": edge.source_port,
+						"target_port": edge.target_port,
 					}
 				)
 		return {"schema": 1, "nodes": nodes, "edges": edges}
@@ -1550,6 +1578,7 @@ class WorkflowScene(QGraphicsScene):
 			source = cast(str, entry.get("source"))
 			target = cast(str, entry.get("target"))
 			source_port = entry.get("source_port", 0)
+			target_port = entry.get("target_port", 0)
 			if not source or not target:
 				continue
 			if source not in self.node_items or target not in self.node_items:
@@ -1561,7 +1590,17 @@ class WorkflowScene(QGraphicsScene):
 				self.message_posted.emit(f"忽略连接 {source} -> {target}: 端口索引无效")
 				continue
 			try:
-				self.graph.add_edge(source, target, source_port=port_index)
+				target_port_index = int(target_port)
+			except (TypeError, ValueError):
+				self.message_posted.emit(f"忽略连接 {source} -> {target}: 目标端口索引无效")
+				continue
+			try:
+				self.graph.add_edge(
+					source,
+					target,
+					source_port=port_index,
+					target_port=target_port_index,
+				)
 			except ValueError as exc:
 				self.message_posted.emit(f"连接 {source} -> {target} 失败: {exc}")
 				continue
@@ -1572,12 +1611,27 @@ class WorkflowScene(QGraphicsScene):
 				self.message_posted.emit(
 					f"连接 {source} -> {target} 使用的端口不存在，已跳过"
 				)
-				self.graph.remove_edge(source, target, source_port=port_index)
+				self.graph.remove_edge(
+					source,
+					target,
+					source_port=port_index,
+					target_port=target_port_index,
+				)
 				continue
-			connection = ConnectionItem(
-				source_port_item,
-				self.node_items[target].input_port,
-			)
+			try:
+				target_port_item = self.node_items[target].get_input_port(target_port_index)
+			except IndexError:
+				self.message_posted.emit(
+					f"连接 {source} -> {target} 的输入端口不存在，已跳过"
+				)
+				self.graph.remove_edge(
+					source,
+					target,
+					source_port=port_index,
+					target_port=target_port_index,
+				)
+				continue
+			connection = ConnectionItem(source_port_item, target_port_item)
 			self.connections.append(connection)
 			self.addItem(connection)
 		self._recalculate_scene_rect()
