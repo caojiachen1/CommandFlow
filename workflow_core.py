@@ -7,11 +7,12 @@ these primitives, while unit tests exercise the pure-Python execution code.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Set, Tuple, cast
 
 from window_utils import activate_window, find_window_by_title, is_window_valid
 
@@ -100,6 +101,123 @@ class ExecutionContext:
         return self.results.get(node_id)
 
 
+_ALLOWED_EXPR_NODES: tuple[type[ast.AST], ...] = (
+    ast.Expression,
+    ast.BoolOp,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Compare,
+    ast.Call,
+    ast.Name,
+    ast.Load,
+    ast.Subscript,
+    ast.Attribute,
+    ast.Constant,
+    ast.List,
+    ast.Tuple,
+    ast.Dict,
+    ast.Set,
+    ast.Slice,
+    ast.IfExp,
+    ast.And,
+    ast.Or,
+    ast.Not,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+    ast.Is,
+    ast.IsNot,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.USub,
+    ast.UAdd,
+    ast.BitAnd,
+    ast.BitOr,
+    ast.BitXor,
+    ast.Invert,
+)
+
+_ALLOWED_CALLABLES: Dict[str, Callable[..., Any]] = {
+    "len": len,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "any": any,
+    "all": all,
+    "abs": abs,
+    "round": round,
+    "int": int,
+    "float": float,
+    "str": str,
+    "bool": bool,
+    "range": range,
+}
+
+_ADDITIONAL_ALLOWED_CALLS: Set[str] = {"value"}
+
+_ALLOWED_NAME_OVERRIDES: Dict[str, Any] = {
+    "True": True,
+    "False": False,
+    "None": None,
+}
+
+
+def _validate_expression_ast(tree: ast.AST) -> None:
+    allowed_calls = set(_ALLOWED_CALLABLES).union(_ADDITIONAL_ALLOWED_CALLS)
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_EXPR_NODES):
+            raise ExecutionError(f"表达式包含不支持的语法: {type(node).__name__}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in allowed_calls:
+                allowed = ", ".join(sorted(allowed_calls))
+                raise ExecutionError(f"表达式只能调用受支持的函数: {allowed}")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            raise ExecutionError("不允许访问以 '__' 开头的属性")
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            raise ExecutionError("不允许访问以 '__' 开头的名称")
+
+
+def evaluate_expression(
+    expression: str,
+    context: ExecutionContext,
+    extra_values: Optional[Dict[str, Any]] = None,
+) -> Any:
+    expr = expression.strip()
+    if not expr:
+        raise ExecutionError("表达式不能为空")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:  # pragma: no cover - defensive parsing guard
+        raise ExecutionError(f"表达式语法错误: {exc}") from exc
+    _validate_expression_ast(tree)
+    scope: Dict[str, Any] = dict(_ALLOWED_CALLABLES)
+    scope.update(_ALLOWED_NAME_OVERRIDES)
+    scope["results"] = context.results
+    scope["value"] = context.get
+    if extra_values:
+        scope.update(extra_values)
+    compiled = compile(tree, "<workflow-expression>", "eval")
+    return eval(compiled, {"__builtins__": {}}, scope)
+
+
+def evaluate_condition(
+    expression: str,
+    context: ExecutionContext,
+    extra_values: Optional[Dict[str, Any]] = None,
+) -> bool:
+    result = evaluate_expression(expression, context, extra_values)
+    return bool(result)
+
 class WorkflowNodeModel:
     """Base class for workflow node definitions."""
 
@@ -137,6 +255,18 @@ class WorkflowNodeModel:
 
     def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Any:
         raise NotImplementedError
+
+    def output_ports(self) -> List[str]:
+        """Return display labels for each output port."""
+
+        return ["继续"]
+
+    def determine_next(
+        self,
+        graph: "WorkflowGraph",
+        context: ExecutionContext,
+    ) -> Optional[str]:
+        return graph.get_outgoing_target(self.id, 0)
 
 
 class ScreenshotNode(WorkflowNodeModel):
@@ -1758,6 +1888,259 @@ class CommandNode(WorkflowNodeModel):
         return result
 
 
+class IfConditionNode(WorkflowNodeModel):
+    type_name = "if_condition"
+    display_name = "条件判断"
+    category = "控制流"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"expression": "True"}
+
+    def output_ports(self) -> List[str]:
+        return ["条件成立", "条件不成立"]
+
+    def validate_config(self) -> None:
+        expression = self.config.get("expression", "")
+        if not isinstance(expression, str):
+            raise ValueError("表达式必须是字符串")
+        expr = expression.strip()
+        if not expr:
+            raise ValueError("条件表达式不能为空")
+        self.config["expression"] = expr
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "expression",
+                "label": "条件表达式",
+                "type": "multiline",
+            }
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> bool:  # noqa: ARG002
+        expression = self.config["expression"]
+        result = evaluate_expression(expression, context)
+        condition = bool(result)
+        context.record(self.id, {"condition": condition, "value": result})
+        return condition
+
+    def determine_next(
+        self,
+        graph: "WorkflowGraph",
+        context: ExecutionContext,
+    ) -> Optional[str]:
+        state = context.get(self.id)
+        condition = False
+        if isinstance(state, dict):
+            condition = bool(state.get("condition"))
+        elif isinstance(state, bool):
+            condition = state
+        if condition:
+            return graph.get_outgoing_target(self.id, 0)
+        return graph.get_outgoing_target(self.id, 1)
+
+
+class WhileLoopNode(WorkflowNodeModel):
+    type_name = "while_loop"
+    display_name = "While 循环"
+    category = "控制流"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {"expression": "False", "max_iterations": 1000}
+
+    def output_ports(self) -> List[str]:
+        return ["循环结束", "循环入口", "循环出口"]
+
+    def validate_config(self) -> None:
+        expression = self.config.get("expression", "")
+        if not isinstance(expression, str):
+            raise ValueError("表达式必须是字符串")
+        expr = expression.strip()
+        if not expr:
+            raise ValueError("循环条件不能为空")
+        max_iterations = self.config.get("max_iterations", 1000)
+        try:
+            max_iter_value = int(max_iterations)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("最大迭代次数必须为正整数") from exc
+        if max_iter_value <= 0:
+            raise ValueError("最大迭代次数必须为正整数")
+        self.config["expression"] = expr
+        self.config["max_iterations"] = max_iter_value
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "expression",
+                "label": "循环条件表达式",
+                "type": "multiline",
+            },
+            {
+                "key": "max_iterations",
+                "label": "最大迭代次数",
+                "type": "int",
+                "min": 1,
+                "max": 1_000_000,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> bool:  # noqa: ARG002
+        state = context.get(self.id)
+        iteration = 0
+        if isinstance(state, dict):
+            iteration = int(state.get("iteration", 0))
+        expression = self.config["expression"]
+        condition = evaluate_condition(expression, context, {"iteration": iteration})
+        if condition:
+            iteration += 1
+            max_iterations = int(self.config["max_iterations"])
+            if iteration > max_iterations:
+                raise ExecutionError("While 循环超过最大迭代次数限制")
+        context.record(
+            self.id,
+            {
+                "condition": condition,
+                "iteration": iteration,
+            },
+        )
+        return condition
+
+    def determine_next(
+        self,
+        graph: "WorkflowGraph",
+        context: ExecutionContext,
+    ) -> Optional[str]:
+        state = context.get(self.id)
+        condition = False
+        if isinstance(state, dict):
+            condition = bool(state.get("condition"))
+        if condition:
+            return graph.get_outgoing_target(self.id, 1)
+        return graph.get_outgoing_target(self.id, 0)
+
+
+class ForLoopNode(WorkflowNodeModel):
+    type_name = "for_loop"
+    display_name = "For 循环"
+    category = "控制流"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "start": 0,
+            "end": 1,
+            "step": 1,
+            "max_iterations": 1000,
+        }
+
+    def output_ports(self) -> List[str]:
+        return ["循环结束", "循环入口", "循环出口"]
+
+    def validate_config(self) -> None:
+        numeric_keys = ("start", "end", "step")
+        for key in numeric_keys:
+            value = self.config.get(key, 0)
+            try:
+                int_value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} 必须为整数") from exc
+            self.config[key] = int_value
+        if int(self.config["step"]) == 0:
+            raise ValueError("步长不能为 0")
+        max_iterations = self.config.get("max_iterations", 1000)
+        try:
+            max_iter_value = int(max_iterations)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("最大迭代次数必须为正整数") from exc
+        if max_iter_value <= 0:
+            raise ValueError("最大迭代次数必须为正整数")
+        self.config["max_iterations"] = max_iter_value
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "start",
+                "label": "起始值",
+                "type": "int",
+                "min": -1_000_000,
+                "max": 1_000_000,
+            },
+            {
+                "key": "end",
+                "label": "结束值(不含)",
+                "type": "int",
+                "min": -1_000_000,
+                "max": 1_000_000,
+            },
+            {
+                "key": "step",
+                "label": "步长",
+                "type": "int",
+                "min": -1_000_000,
+                "max": 1_000_000,
+            },
+            {
+                "key": "max_iterations",
+                "label": "最大迭代次数",
+                "type": "int",
+                "min": 1,
+                "max": 1_000_000,
+            },
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Dict[str, Any]:  # noqa: ARG002
+        cfg = self.config
+        start = int(cfg["start"])
+        step = int(cfg["step"])
+        end = int(cfg["end"])
+        max_iterations = int(cfg["max_iterations"])
+        state = context.get(self.id)
+        if not isinstance(state, dict) or state.get("completed"):
+            current = start
+            iteration = 0
+        else:
+            current = int(state.get("next_value", start))
+            iteration = int(state.get("iteration", 0))
+        if step > 0:
+            should_continue = current < end
+        else:
+            should_continue = current > end
+        if should_continue:
+            iteration += 1
+            if iteration > max_iterations:
+                raise ExecutionError("For 循环超过最大迭代次数限制")
+            next_value = current + step
+            record = {
+                "value": current,
+                "iteration": iteration,
+                "next_value": next_value,
+                "should_continue": True,
+                "completed": False,
+            }
+        else:
+            record = {
+                "value": current,
+                "iteration": iteration,
+                "next_value": current,
+                "should_continue": False,
+                "completed": True,
+            }
+        context.record(self.id, record)
+        return record
+
+    def determine_next(
+        self,
+        graph: "WorkflowGraph",
+        context: ExecutionContext,
+    ) -> Optional[str]:
+        state = context.get(self.id)
+        should_continue = False
+        if isinstance(state, dict):
+            should_continue = bool(state.get("should_continue"))
+        if should_continue:
+            return graph.get_outgoing_target(self.id, 1)
+        return graph.get_outgoing_target(self.id, 0)
+
+
 NODE_REGISTRY = {
     ScreenshotNode.type_name: ScreenshotNode,
     MouseClickNode.type_name: MouseClickNode,
@@ -1783,7 +2166,16 @@ NODE_REGISTRY = {
     FileDeleteNode.type_name: FileDeleteNode,
     CommandNode.type_name: CommandNode,
     SwitchContextNode.type_name: SwitchContextNode,
+    IfConditionNode.type_name: IfConditionNode,
+    WhileLoopNode.type_name: WhileLoopNode,
+    ForLoopNode.type_name: ForLoopNode,
 }
+
+
+@dataclass(frozen=True)
+class OutgoingEdge:
+    target: str
+    port_index: int
 
 
 class WorkflowGraph:
@@ -1791,7 +2183,7 @@ class WorkflowGraph:
 
     def __init__(self) -> None:
         self.nodes: Dict[str, WorkflowNodeModel] = {}
-        self.edges: Dict[str, List[str]] = {}
+        self.edges: Dict[str, List[OutgoingEdge]] = {}
         self.reverse_edges: Dict[str, List[str]] = {}
 
     def add_node(self, node: WorkflowNodeModel) -> None:
@@ -1806,31 +2198,144 @@ class WorkflowGraph:
             return
         for upstream in list(self.reverse_edges[node_id]):
             self.remove_edge(upstream, node_id)
-        for downstream in list(self.edges[node_id]):
-            self.remove_edge(node_id, downstream)
+        for edge in list(self.edges[node_id]):
+            self.remove_edge(node_id, edge.target, edge.port_index)
         del self.nodes[node_id]
         del self.edges[node_id]
         del self.reverse_edges[node_id]
 
-    def add_edge(self, source_id: str, target_id: str) -> None:
+    def add_edge(self, source_id: str, target_id: str, *, source_port: int = 0) -> None:
         if source_id == target_id:
             raise ValueError("Cannot connect node to itself")
         if source_id not in self.nodes or target_id not in self.nodes:
             raise ValueError("Both nodes must exist")
-        if target_id in self.edges[source_id]:
-            return
-        self.edges[source_id].append(target_id)
-        self.reverse_edges[target_id].append(source_id)
-        if self._has_cycle():
-            self.edges[source_id].remove(target_id)
-            self.reverse_edges[target_id].remove(source_id)
-            raise ValueError("Adding this connection creates a cycle")
+        node = self.nodes[source_id]
+        port_labels = node.output_ports()
+        if not port_labels:
+            raise ValueError(f"节点 {node.title} 不支持输出连接")
+        if source_port < 0 or source_port >= len(port_labels):
+            raise ValueError(
+                f"节点 {node.title} 的输出端口索引无效: {source_port}"
+            )
+        for edge in self.edges[source_id]:
+            if edge.port_index == source_port:
+                raise ValueError(
+                    f"节点 {node.title} 的输出端口 '{port_labels[source_port]}' 已连接，不能重复连接"
+                )
+        self.edges[source_id].append(OutgoingEdge(target_id, source_port))
+        if source_id not in self.reverse_edges[target_id]:
+            self.reverse_edges[target_id].append(source_id)
 
-    def remove_edge(self, source_id: str, target_id: str) -> None:
-        if source_id in self.edges and target_id in self.edges[source_id]:
-            self.edges[source_id].remove(target_id)
-        if target_id in self.reverse_edges and source_id in self.reverse_edges[target_id]:
-            self.reverse_edges[target_id].remove(source_id)
+    def remove_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        source_port: int | None = None,
+    ) -> None:
+        if source_id not in self.edges:
+            return
+        removed = False
+        remaining: List[OutgoingEdge] = []
+        for edge in self.edges[source_id]:
+            if edge.target == target_id and (
+                source_port is None or edge.port_index == source_port
+            ):
+                removed = True
+                continue
+            remaining.append(edge)
+        self.edges[source_id] = remaining
+        if removed and target_id in self.reverse_edges:
+            if source_id in self.reverse_edges[target_id]:
+                self.reverse_edges[target_id].remove(source_id)
+
+    def entry_nodes(self) -> List[str]:
+        return sorted(
+            node_id for node_id, parents in self.reverse_edges.items() if not parents
+        )
+
+    def validate(self) -> None:
+        if not self.nodes:
+            raise ExecutionError("工作流为空")
+        entries = self.entry_nodes()
+        if not entries:
+            raise ExecutionError("工作流缺少入口节点，请至少保留一个没有输入连接的节点")
+        if len(entries) > 1:
+            joined_entries = ", ".join(entries)
+            raise ExecutionError(
+                f"检测到多个入口节点: {joined_entries}。当前版本仅支持单一入口节点"
+            )
+        reachable: Set[str] = set()
+        stack = list(entries)
+        while stack:
+            current = stack.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            for edge in self.edges.get(current, []):
+                stack.append(edge.target)
+        if len(reachable) != len(self.nodes):
+            unreachable = sorted(set(self.nodes) - reachable)
+            joined = ", ".join(unreachable)
+            raise ExecutionError(f"存在无法到达的节点: {joined}")
+        loop_tail_sources: Dict[str, str] = {}
+        for node_id, node in self.nodes.items():
+            port_labels = node.output_ports()
+            if not port_labels:
+                continue
+            mapped: Dict[int, OutgoingEdge] = {}
+            for edge in self.edges.get(node_id, []):
+                if edge.port_index >= len(port_labels):
+                    raise ExecutionError(
+                        f"节点 {node.title} 的连接数据无效: 端口索引 {edge.port_index} 超出范围"
+                    )
+                if edge.port_index in mapped:
+                    raise ExecutionError(
+                        f"节点 {node.title} 的输出端口 '{port_labels[edge.port_index]}' 存在多个连接"
+                    )
+                mapped[edge.port_index] = edge
+            if isinstance(node, IfConditionNode):
+                for idx, label in enumerate(port_labels):
+                    if idx not in mapped:
+                        raise ExecutionError(
+                            f"{node.title} 的输出端口 '{label}' 未连接"
+                        )
+            elif isinstance(node, (WhileLoopNode, ForLoopNode)):
+                required_ports = {
+                    1: port_labels[1],
+                    2: port_labels[2],
+                }
+                for idx, label in required_ports.items():
+                    if idx not in mapped:
+                        raise ExecutionError(
+                            f"{node.title} 的输出端口 '{label}' 未连接"
+                        )
+                tail_edge = mapped[2]
+                tail_target = tail_edge.target
+                if tail_target == node_id:
+                    raise ExecutionError(
+                        f"{node.title} 的输出端口 '{port_labels[2]}' 不能连接到节点自身"
+                    )
+                previous_loop = loop_tail_sources.get(tail_target)
+                if previous_loop is not None and previous_loop != node_id:
+                    tail_title = (
+                        self.nodes[tail_target].title
+                        if tail_target in self.nodes
+                        else tail_target
+                    )
+                    prev_title = (
+                        self.nodes[previous_loop].title
+                        if previous_loop in self.nodes
+                        else previous_loop
+                    )
+                    raise ExecutionError(
+                        f"节点 {tail_title} 已被循环节点 {prev_title} 用作循环结尾"
+                    )
+                loop_tail_sources[tail_target] = node_id
+            else:
+                if len(mapped) > 1:
+                    raise ExecutionError(
+                        f"{node.title} 只能连接到一个后续节点，如需分支请使用条件节点"
+                    )
 
     def _has_cycle(self) -> bool:
         try:
@@ -1847,7 +2352,8 @@ class WorkflowGraph:
         while queue:
             current = queue.pop(0)
             order.append(current)
-            for neighbor in self.edges[current]:
+            for edge in self.edges[current]:
+                neighbor = edge.target
                 tmp_indegree[neighbor] -= 1
                 if tmp_indegree[neighbor] == 0:
                     queue.append(neighbor)
@@ -1861,17 +2367,37 @@ class WorkflowGraph:
             node_cls = type(node)
             graph.add_node(node_cls(node.id, node.title, node.config.copy()))
         for source, targets in self.edges.items():
-            for target in targets:
-                graph.edges[source].append(target)
-                graph.reverse_edges[target].append(source)
+            for edge in targets:
+                graph.edges[source].append(OutgoingEdge(edge.target, edge.port_index))
+                if source not in graph.reverse_edges[edge.target]:
+                    graph.reverse_edges[edge.target].append(source)
         return graph
+
+    def build_loop_back_map(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for node_id, node in self.nodes.items():
+            if not isinstance(node, (WhileLoopNode, ForLoopNode)):
+                continue
+            for edge in self.edges.get(node_id, []):
+                if edge.port_index == 2:
+                    mapping[edge.target] = node_id
+        return mapping
+
+    def get_outgoing_target(self, node_id: str, port_index: int) -> Optional[str]:
+        for edge in self.edges.get(node_id, []):
+            if edge.port_index == port_index:
+                return edge.target
+        return None
 
 
 class WorkflowExecutor:
-    """Execute a ``WorkflowGraph`` sequentially in topological order."""
+    """Execute a ``WorkflowGraph`` following control-flow edges."""
 
-    def __init__(self, runtime: AutomationRuntime) -> None:
+    def __init__(self, runtime: AutomationRuntime, *, max_steps: int = 10000) -> None:
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive")
         self.runtime = runtime
+        self.max_steps = int(max_steps)
 
     def run(
         self,
@@ -1879,17 +2405,50 @@ class WorkflowExecutor:
         *,
         should_stop: Callable[[], bool] | None = None,
     ) -> ExecutionContext:
+        graph.validate()
+        loop_back_map = graph.build_loop_back_map()
         context = ExecutionContext()
-        order = graph.topological_order()
-        for node_id in order:
+        executed_steps = 0
+        for start_id in graph.entry_nodes():
+            executed_steps = self._run_from(
+                start_id,
+                graph,
+                context,
+                should_stop,
+                executed_steps,
+                loop_back_map,
+            )
+        return context
+
+    def _run_from(
+        self,
+        start_id: str,
+        graph: WorkflowGraph,
+        context: ExecutionContext,
+        should_stop: Callable[[], bool] | None,
+        executed_steps: int,
+        loop_back_map: Dict[str, str],
+    ) -> int:
+        current = start_id
+        while current is not None:
             if should_stop is not None and should_stop():
                 raise ExecutionError("Execution cancelled")
-            node = graph.nodes[node_id]
+            node = graph.nodes.get(current)
+            if node is None:
+                raise ExecutionError(f"节点 {current} 不存在")
+            executed_steps += 1
+            if executed_steps > self.max_steps:
+                raise ExecutionError("执行步数超过上限，可能存在无限循环")
             try:
                 node.execute(context, self.runtime)
             except Exception as exc:  # pragma: no cover - GUI handles error display
                 raise ExecutionError(f"Node {node.title} failed: {exc}") from exc
-        return context
+            next_id = node.determine_next(graph, context)
+            loop_controller = loop_back_map.get(current)
+            if loop_controller is not None:
+                next_id = loop_controller
+            current = next_id
+        return executed_steps
 
 
 def create_node(node_type: str, node_id: str, title: Optional[str] = None) -> WorkflowNodeModel:

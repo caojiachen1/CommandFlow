@@ -176,6 +176,8 @@ INFOBAR_AVAILABLE = HAVE_FLUENT_WIDGETS and InfoBar is not None and InfoBarPosit
 from workflow_core import (
 	AutomationRuntime,
 	ExecutionError,
+	ForLoopNode,
+	WhileLoopNode,
 	WorkflowExecutor,
 	WorkflowGraph,
 	create_node,
@@ -758,7 +760,13 @@ class WorkflowView(QGraphicsView):
 class NodePort(QGraphicsEllipseItem):
 	"""Circular port used for incoming or outgoing connections."""
 
-	def __init__(self, parent: "WorkflowNodeItem", kind: str) -> None:
+	def __init__(
+		self,
+		parent: "WorkflowNodeItem",
+		kind: str,
+		port_index: int,
+		label: Optional[str] = None,
+	) -> None:
 		super().__init__(-6, -6, 12, 12, parent)
 		self._is_hovered = False
 		self._is_highlighted = False
@@ -773,7 +781,13 @@ class NodePort(QGraphicsEllipseItem):
 			QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
 		)
 		self.kind = kind
+		self.port_index = port_index
+		self._label = label or ""
 		self.setAcceptHoverEvents(True)
+		if label:
+			self.setToolTip(label)
+		else:
+			self.setToolTip("输入" if kind == "input" else "输出")
 
 	def hoverEnterEvent(self, event):  # noqa: D401
 		self._is_hovered = True
@@ -849,9 +863,10 @@ class WorkflowNodeItem(QGraphicsRectItem):
 	WIDTH = 200
 	HEIGHT = 100
 
-	def __init__(self, node_id: str, title: str) -> None:
+	def __init__(self, node_model: WorkflowNodeModel) -> None:
 		super().__init__(0, 0, self.WIDTH, self.HEIGHT)
-		self.node_id = node_id
+		self.node_model = node_model
+		self.node_id = node_model.id
 		self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
 		self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
 		self.setFlag(
@@ -864,7 +879,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self._base_color = QColor(53, 53, 53)
 		self._accent_color = QColor(90, 90, 90)
 		self._paint_margin = 8.0
-		self.title_item = QGraphicsTextItem(title, self)
+		self.title_item = QGraphicsTextItem(node_model.title, self)
 		title_font = QFont(self.title_item.font())
 		title_font.setPointSizeF(title_font.pointSizeF() + 1.5)
 		title_font.setBold(True)
@@ -872,16 +887,26 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.title_item.setDefaultTextColor(QColor(220, 220, 220))
 		self.title_item.setPos(20, 14)
 		self.title_item.setZValue(1)
-		self.input_port = NodePort(self, "input")
-		self.output_port = NodePort(self, "output")
+		self.input_port = NodePort(self, "input", 0, "输入")
+		self.output_ports: List[NodePort] = []
+		for idx, label in enumerate(node_model.output_ports()):
+			port = NodePort(self, "output", idx, label)
+			self.output_ports.append(port)
 		self.update_ports()
 
 	def update_ports(self) -> None:
 		self.input_port.setPos(1, self.HEIGHT / 2 - 6)
-		self.output_port.setPos(self.WIDTH - 1, self.HEIGHT / 2 - 6)
+		count = len(self.output_ports)
+		if count == 0:
+			return
+		spacing = self.HEIGHT / (count + 1)
+		for offset, port in enumerate(self.output_ports, start=1):
+			y_pos = spacing * offset - 6
+			port.setPos(self.WIDTH - 1, y_pos)
 
 	def set_title(self, title: str) -> None:
 		self.title_item.setPlainText(title)
+		self.node_model.title = title
 
 	def itemChange(self, change, value):  # noqa: D401
 		if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -892,6 +917,15 @@ class WorkflowNodeItem(QGraphicsRectItem):
 				scene.ensure_scene_visible(self)
 				scene.modified.emit()
 		return super().itemChange(change, value)
+
+	def get_output_port(self, index: int) -> NodePort:
+		if index < 0 or index >= len(self.output_ports):
+			raise IndexError("output port index out of range")
+		return self.output_ports[index]
+
+	@property
+	def primary_output_port(self) -> NodePort:
+		return self.output_ports[0]
 
 	def mouseDoubleClickEvent(self, event):  # noqa: D401
 		scene = cast(WorkflowScene, self.scene())
@@ -1132,7 +1166,7 @@ class WorkflowScene(QGraphicsScene):
 		except ValueError as exc:
 			self.message_posted.emit(f"无法创建节点: {exc}")
 			return
-		item = WorkflowNodeItem(node_id, node_model.title)
+		item = WorkflowNodeItem(node_model)
 		item.setPos(pos - QPointF(item.WIDTH / 2, item.HEIGHT / 2))
 		self.addItem(item)
 		self.node_items[node_id] = item
@@ -1146,6 +1180,54 @@ class WorkflowScene(QGraphicsScene):
 	def _promote_node(self, item: "WorkflowNodeItem") -> None:
 		self._z_counter += 1
 		item.setZValue(float(self._z_counter))
+
+	def _is_loop_tail_port(self, port: NodePort) -> bool:
+		if port.kind != "output" or port.port_index != 2:
+			return False
+		parent_item = cast(WorkflowNodeItem, port.parentItem())
+		node_model = parent_item.node_model
+		return isinstance(node_model, (WhileLoopNode, ForLoopNode))
+
+	def _candidate_target_ports(self, source_port: NodePort) -> List[NodePort]:
+		ports: List[NodePort] = []
+		seen: set[int] = set()
+		allow_outputs = self._is_loop_tail_port(source_port)
+		if allow_outputs:
+			for item in self.node_items.values():
+				for port in item.output_ports:
+					if port is source_port:
+						continue
+					parent = port.parentItem()
+					if parent is source_port.parentItem():
+						continue
+					identifier = id(port)
+					if identifier in seen:
+						continue
+					ports.append(port)
+					seen.add(identifier)
+		for item in self.node_items.values():
+			candidate = item.input_port
+			if candidate is source_port:
+				continue
+			if candidate.parentItem() is source_port.parentItem():
+				continue
+			identifier = id(candidate)
+			if identifier in seen:
+				continue
+			ports.append(candidate)
+			seen.add(identifier)
+		return ports
+
+	def _can_connect_ports(self, source_port: NodePort, target_port: NodePort) -> bool:
+		if target_port.kind == "input":
+			return target_port is not source_port and target_port.parentItem() is not source_port.parentItem()
+		if target_port.kind == "output":
+			return (
+				self._is_loop_tail_port(source_port)
+				and target_port is not source_port
+				and target_port.parentItem() is not source_port.parentItem()
+			)
+		return False
 
 	def handle_port_press(self, port: NodePort) -> None:
 		if port.kind != "output":
@@ -1172,19 +1254,23 @@ class WorkflowScene(QGraphicsScene):
 		if self._pending_output is None or self._temp_connection is None:
 			return
 		source_port = self._pending_output
-		target_port: Optional[NodePort] = None
-		if port.kind == "input" and port is not source_port:
-			target_port = port
-		elif self._hover_port is not None and self._hover_port is not source_port:
-			target_port = self._hover_port
-		if target_port is None:
+		candidate: Optional[NodePort] = None
+		if port is not source_port and self._can_connect_ports(source_port, port):
+			candidate = port
+		elif (
+			self._hover_port is not None
+			and self._hover_port is not source_port
+			and self._can_connect_ports(source_port, self._hover_port)
+		):
+			candidate = self._hover_port
+		if candidate is None:
 			self._clear_temp_line()
 			return
-		self._finalize_connection(target_port)
+		self._finalize_connection(candidate)
 
 	def mouseReleaseEvent(self, event):  # noqa: D401
 		if self._pending_output is not None and self._temp_connection is not None:
-			target_port = self._find_nearest_input(event.scenePos(), self._pending_output)
+			target_port = self._find_nearest_target_port(event.scenePos(), self._pending_output)
 			if target_port is not None:
 				self._finalize_connection(target_port)
 			else:
@@ -1207,7 +1293,11 @@ class WorkflowScene(QGraphicsScene):
 				target_port = cast(NodePort, item.target)
 				source_node = cast(WorkflowNodeItem, source_port.parentItem()).node_id
 				target_node = cast(WorkflowNodeItem, target_port.parentItem()).node_id
-				self.graph.remove_edge(source_node, target_node)
+				self.graph.remove_edge(
+					source_node,
+					target_node,
+					source_port=source_port.port_index,
+				)
 				self.removeItem(item)
 				if item in self.connections:
 					self.connections.remove(item)
@@ -1224,7 +1314,11 @@ class WorkflowScene(QGraphicsScene):
 		source_node = cast(WorkflowNodeItem, source_port.parentItem()).node_id
 		target_node = cast(WorkflowNodeItem, target_port.parentItem()).node_id
 		try:
-			self.graph.add_edge(source_node, target_node)
+			self.graph.add_edge(
+				source_node,
+				target_node,
+				source_port=source_port.port_index,
+			)
 		except ValueError as exc:
 			self.message_posted.emit(str(exc))
 			self._clear_temp_line()
@@ -1262,10 +1356,7 @@ class WorkflowScene(QGraphicsScene):
 		threshold = 24.0
 		best_port: Optional[NodePort] = None
 		best_distance = threshold
-		for item in self.node_items.values():
-			candidate = item.input_port
-			if candidate is self._pending_output:
-				continue
+		for candidate in self._candidate_target_ports(self._pending_output):
 			center = candidate.sceneBoundingRect().center()
 			distance = math.hypot(center.x() - pos.x(), center.y() - pos.y())
 			if distance <= best_distance:
@@ -1273,7 +1364,7 @@ class WorkflowScene(QGraphicsScene):
 				best_port = candidate
 		self._set_hover_port(best_port)
 
-	def _find_nearest_input(
+	def _find_nearest_target_port(
 		self,
 		pos: QPointF,
 		source_port: Optional[NodePort],
@@ -1281,10 +1372,9 @@ class WorkflowScene(QGraphicsScene):
 	) -> Optional[NodePort]:
 		best_port: Optional[NodePort] = None
 		best_distance = threshold
-		for item in self.node_items.values():
-			candidate = item.input_port
-			if candidate is source_port:
-				continue
+		if source_port is None:
+			return None
+		for candidate in self._candidate_target_ports(source_port):
 			center = candidate.sceneBoundingRect().center()
 			distance = math.hypot(center.x() - pos.x(), center.y() - pos.y())
 			if distance <= best_distance:
@@ -1345,7 +1435,11 @@ class WorkflowScene(QGraphicsScene):
 	def _remove_connection(self, connection: ConnectionItem) -> None:
 		source = cast(WorkflowNodeItem, connection.source.parentItem()).node_id
 		target = cast(WorkflowNodeItem, connection.target.parentItem()).node_id
-		self.graph.remove_edge(source, target)
+		self.graph.remove_edge(
+			source,
+			target,
+			source_port=cast(NodePort, connection.source).port_index,
+		)
 		self.removeItem(connection)
 		if connection in self.connections:
 			self.connections.remove(connection)
@@ -1405,10 +1499,16 @@ class WorkflowScene(QGraphicsScene):
 					"position": {"x": float(pos.x()), "y": float(pos.y())},
 				}
 			)
-		edges: List[Dict[str, str]] = []
+		edges: List[Dict[str, Any]] = []
 		for source, targets in self.graph.edges.items():
-			for target in targets:
-				edges.append({"source": source, "target": target})
+			for edge in targets:
+				edges.append(
+					{
+						"source": source,
+						"target": edge.target,
+						"source_port": edge.port_index,
+					}
+				)
 		return {"schema": 1, "nodes": nodes, "edges": edges}
 
 	def import_workflow(self, data: Dict[str, Any], *, mark_modified: bool = False) -> None:
@@ -1436,7 +1536,7 @@ class WorkflowScene(QGraphicsScene):
 				continue
 			node_model.title = title
 			self.graph.add_node(node_model)
-			item = WorkflowNodeItem(node_id, node_model.title)
+			item = WorkflowNodeItem(node_model)
 			position = entry.get("position", {})
 			x_val = float(position.get("x", 0.0)) if isinstance(position, dict) else 0.0
 			y_val = float(position.get("y", 0.0)) if isinstance(position, dict) else 0.0
@@ -1449,18 +1549,33 @@ class WorkflowScene(QGraphicsScene):
 		for entry in edges_data:
 			source = cast(str, entry.get("source"))
 			target = cast(str, entry.get("target"))
+			source_port = entry.get("source_port", 0)
 			if not source or not target:
 				continue
 			if source not in self.node_items or target not in self.node_items:
 				self.message_posted.emit(f"忽略无效连接 {source} -> {target}")
 				continue
 			try:
-				self.graph.add_edge(source, target)
+				port_index = int(source_port)
+			except (TypeError, ValueError):
+				self.message_posted.emit(f"忽略连接 {source} -> {target}: 端口索引无效")
+				continue
+			try:
+				self.graph.add_edge(source, target, source_port=port_index)
 			except ValueError as exc:
 				self.message_posted.emit(f"连接 {source} -> {target} 失败: {exc}")
 				continue
+			source_item = self.node_items[source]
+			try:
+				source_port_item = source_item.get_output_port(port_index)
+			except IndexError:
+				self.message_posted.emit(
+					f"连接 {source} -> {target} 使用的端口不存在，已跳过"
+				)
+				self.graph.remove_edge(source, target, source_port=port_index)
+				continue
 			connection = ConnectionItem(
-				self.node_items[source].output_port,
+				source_port_item,
 				self.node_items[target].input_port,
 			)
 			self.connections.append(connection)
