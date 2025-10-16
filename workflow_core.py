@@ -1898,8 +1898,18 @@ class ConditionNodeBase(WorkflowNodeModel):
 
     category = "条件判断"
 
+    def input_ports(self) -> List[str]:
+        return []
+
     def output_ports(self) -> List[str]:
-        return ["下一步", "条件结果"]
+        return ["条件结果"]
+
+    def evaluate_condition(self, context: ExecutionContext) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Any:  # noqa: ARG002
+        result = self.evaluate_condition(context)
+        return bool(result.get("condition"))
 
 
 class IfConditionNode(WorkflowNodeModel):
@@ -1943,16 +1953,16 @@ class IfConditionNode(WorkflowNodeModel):
     ) -> Tuple[bool, Any, Optional[str]]:
         incoming = graph.get_incoming_edge(self.id, target_port=1)
         if incoming is not None:
+            source_node = graph.nodes.get(incoming.source)
+            if source_node is None:
+                raise ExecutionError("条件输入节点不存在")
+            if not isinstance(source_node, ConditionNodeBase):
+                raise ExecutionError("条件输入必须来自条件判断节点")
             source_state = context.get(incoming.source)
-            if source_state is None:
-                raise ExecutionError("条件输入尚未执行")
-            raw_value = None
-            if isinstance(source_state, dict) and "condition" in source_state:
-                raw_value = source_state.get("value", source_state["condition"])
-                result = bool(source_state["condition"])
-            else:
-                raw_value = source_state
-                result = bool(source_state)
+            if not (isinstance(source_state, dict) and "condition" in source_state):
+                source_state = source_node.evaluate_condition(context)
+            result = bool(source_state.get("condition"))
+            raw_value = source_state.get("value", source_state.get("condition"))
             return result, raw_value, incoming.source
         expression = self.config["expression"]
         raw_value = evaluate_expression(expression, context)
@@ -2036,7 +2046,7 @@ class BinaryExpressionConditionNode(ConditionNodeBase):
     def compare(self, left: Any, right: Any) -> bool:
         raise NotImplementedError
 
-    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> bool:  # noqa: ARG002
+    def evaluate_condition(self, context: ExecutionContext) -> Dict[str, Any]:
         left_value = self._evaluate_operand(self.left_key, context)
         right_value = self._evaluate_operand(self.right_key, context)
         try:
@@ -2046,16 +2056,14 @@ class BinaryExpressionConditionNode(ConditionNodeBase):
             raise
         except Exception as exc:  # pragma: no cover - conversion guard
             raise ExecutionError(f"条件比较失败: {exc}") from exc
-        context.record(
-            self.id,
-            {
-                "condition": result,
-                "left": operand_left,
-                "right": operand_right,
-                "value": result,
-            },
-        )
-        return result
+        record = {
+            "condition": result,
+            "left": operand_left,
+            "right": operand_right,
+            "value": result,
+        }
+        context.record(self.id, record)
+        return record
 
 
 class NumericComparisonConditionNode(BinaryExpressionConditionNode):
@@ -2441,6 +2449,8 @@ class WorkflowGraph:
         target_node = self.nodes[target_id]
         source_ports = source_node.output_ports()
         target_ports = target_node.input_ports()
+        if isinstance(source_node, ConditionNodeBase) and len(source_ports) == 1 and source_port > 0:
+            source_port = 0
         if not source_ports:
             raise ValueError(f"节点 {source_node.title} 不支持输出连接")
         if source_port < 0 or source_port >= len(source_ports):
@@ -2452,11 +2462,15 @@ class WorkflowGraph:
                 f"节点 {target_node.title} 的输入端口索引无效: {target_port}"
             )
         if isinstance(target_node, IfConditionNode) and target_port == 1:
-            if not isinstance(source_node, ConditionNodeBase) or source_port != 1:
+            if not isinstance(source_node, ConditionNodeBase) or source_port != 0:
                 raise ValueError(
                     f"节点 {target_node.title} 的条件输入只能连接条件判断节点的结果端口"
                 )
-        if isinstance(source_node, ConditionNodeBase) and source_port == 1:
+        if isinstance(source_node, ConditionNodeBase):
+            if source_port != 0:
+                raise ValueError(
+                    f"节点 {source_node.title} 的条件结果端口索引无效: {source_port}"
+                )
             if not isinstance(target_node, IfConditionNode) or target_port != 1:
                 raise ValueError(
                     f"节点 {source_node.title} 的条件结果端口只能连接到条件判断控件的条件输入"
@@ -2512,6 +2526,9 @@ class WorkflowGraph:
     def entry_nodes(self) -> List[str]:
         entries: List[str] = []
         for node_id, incoming in self.reverse_edges.items():
+            node = self.nodes.get(node_id)
+            if isinstance(node, ConditionNodeBase):
+                continue
             if not any(edge.target_port == 0 for edge in incoming):
                 entries.append(node_id)
         return sorted(entries)
@@ -2519,6 +2536,13 @@ class WorkflowGraph:
     def validate(self) -> None:
         if not self.nodes:
             raise ExecutionError("工作流为空")
+        control_nodes = {
+            node_id
+            for node_id, node in self.nodes.items()
+            if not isinstance(node, ConditionNodeBase)
+        }
+        if not control_nodes:
+            raise ExecutionError("工作流至少需要一个可执行节点")
         entries = self.entry_nodes()
         if not entries:
             raise ExecutionError("工作流缺少入口节点，请至少保留一个没有输入连接的节点")
@@ -2538,8 +2562,8 @@ class WorkflowGraph:
                 if edge.target_port != 0:
                     continue
                 stack.append(edge.target)
-        if len(reachable) != len(self.nodes):
-            unreachable = sorted(set(self.nodes) - reachable)
+        if len(reachable) != len(control_nodes):
+            unreachable = sorted(control_nodes - reachable)
             joined = ", ".join(unreachable)
             raise ExecutionError(f"存在无法到达的节点: {joined}")
         loop_tail_sources: Dict[str, str] = {}
@@ -2555,24 +2579,20 @@ class WorkflowGraph:
                         f"节点 {node.title} 的连接数据无效: 端口索引 {edge.source_port} 超出范围"
                     )
             if isinstance(node, ConditionNodeBase):
-                for idx, label in enumerate(port_labels):
-                    edges_for_port = mapped.get(idx, [])
-                    if not edges_for_port:
-                        raise ExecutionError(
-                            f"{node.title} 的输出端口 '{label}' 未连接"
-                        )
-                    if len(edges_for_port) > 1:
-                        raise ExecutionError(
-                            f"{node.title} 的输出端口 '{label}' 只能连接一个目标"
-                        )
-                    if idx == 0 and edges_for_port[0].target_port != 0:
-                        raise ExecutionError(
-                            f"{node.title} 的输出端口 '{label}' 必须连接到执行输入端口"
-                        )
-                    if idx == 1 and edges_for_port[0].target_port == 0:
-                        raise ExecutionError(
-                            f"{node.title} 的条件结果输出必须连接到条件输入端口"
-                        )
+                edges_for_result = mapped.get(0, [])
+                if not edges_for_result:
+                    raise ExecutionError(f"{node.title} 的条件结果未连接到 If 控件")
+                if len(edges_for_result) > 1:
+                    raise ExecutionError(f"{node.title} 的条件结果只能连接一个 If 控件")
+                edge = edges_for_result[0]
+                target_node = self.nodes.get(edge.target)
+                if edge.target_port != 1 or not isinstance(target_node, IfConditionNode):
+                    raise ExecutionError(
+                        f"{node.title} 的条件结果必须连接到 If 控件的条件输入端口"
+                    )
+                extra_ports = set(mapped) - {0}
+                if extra_ports:
+                    raise ExecutionError(f"{node.title} 存在无效的输出连接")
             elif isinstance(node, IfConditionNode):
                 condition_edge = self.get_incoming_edge(node_id, target_port=1)
                 if condition_edge is None and not node.config.get("expression"):
@@ -2583,7 +2603,7 @@ class WorkflowGraph:
                         raise ExecutionError(
                             f"{node.title} 的条件输入必须来自条件判断节点"
                         )
-                    if condition_edge.source_port != 1:
+                    if condition_edge.source_port != 0:
                         raise ExecutionError(
                             f"{node.title} 的条件输入必须连接条件节点的结果端口"
                         )

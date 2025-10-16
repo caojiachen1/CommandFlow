@@ -1238,18 +1238,20 @@ class WorkflowScene(QGraphicsScene):
 		target_item = cast(WorkflowNodeItem, target_port.parentItem())
 		if source_port.kind != "output" or target_item is source_item:
 			return False
+		source_model = source_item.node_model
+		target_model = target_item.node_model
+		if isinstance(source_model, ConditionNodeBase):
+			return (
+				target_port.kind == "input"
+				and isinstance(target_model, IfConditionNode)
+				and target_port.port_index == 1
+				and source_port.port_index == 0
+			)
 		if target_port.kind == "input":
-			if isinstance(target_item.node_model, IfConditionNode) and target_port.port_index == 1:
-				return (
-					isinstance(source_item.node_model, ConditionNodeBase)
-					and source_port.port_index == 1
-				)
-			if isinstance(source_item.node_model, ConditionNodeBase) and source_port.port_index == 1:
+			if isinstance(target_model, IfConditionNode) and target_port.port_index == 1:
 				return False
 			return target_port is not source_port
 		if target_port.kind == "output":
-			if isinstance(source_item.node_model, ConditionNodeBase) and source_port.port_index == 1:
-				return False
 			return self._is_loop_tail_port(source_port) and target_item is not source_item
 		return False
 
@@ -1594,6 +1596,9 @@ class WorkflowScene(QGraphicsScene):
 			except (TypeError, ValueError):
 				self.message_posted.emit(f"忽略连接 {source} -> {target}: 目标端口索引无效")
 				continue
+			source_item = self.node_items[source]
+			if isinstance(source_item.node_model, ConditionNodeBase) and port_index > 0:
+				port_index = 0
 			try:
 				self.graph.add_edge(
 					source,
@@ -1604,7 +1609,6 @@ class WorkflowScene(QGraphicsScene):
 			except ValueError as exc:
 				self.message_posted.emit(f"连接 {source} -> {target} 失败: {exc}")
 				continue
-			source_item = self.node_items[source]
 			try:
 				source_port_item = source_item.get_output_port(port_index)
 			except IndexError:
