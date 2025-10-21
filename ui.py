@@ -1059,11 +1059,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 	def _should_show_action_panel(self) -> bool:
 		if self._action_proxy is None:
 			return False
-		if self.isSelected():
-			return True
-		if self._hovered:
-			return True
-		return self._action_proxy.isUnderMouse()
+		return self.isSelected()
 
 	def _update_action_panel_visibility(self) -> None:
 		if self._action_proxy is None:
