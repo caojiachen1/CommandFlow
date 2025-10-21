@@ -73,6 +73,7 @@ from PySide6.QtWidgets import (
 	QGraphicsRectItem,
 	QGraphicsScene,
 	QGraphicsTextItem,
+	QGraphicsProxyWidget,
 	QHBoxLayout,
 	QLabel,
 	QLineEdit,
@@ -84,12 +85,14 @@ from PySide6.QtWidgets import (
 	QSpinBox,
 	QSplitter,
 	QTextEdit,
+	QToolButton,
 	QVBoxLayout,
 	QWidget,
 	QAbstractItemView,
 	QStatusBar,
 	QFrame,
 	QTabWidget,
+	QStyle,
 )
 
 try:
@@ -760,6 +763,100 @@ class WorkflowView(QGraphicsView):
 		self.setCursor(Qt.CursorShape.ArrowCursor)
 
 
+
+class NodeActionPanel(QWidget):
+	"""Compact widget that exposes quick actions for a workflow node."""
+
+	PANEL_WIDTH = 132
+	PANEL_HEIGHT = 36
+
+	actionTriggered = Signal(str, bool)
+
+	def __init__(self, parent: Optional[QWidget] = None) -> None:
+		super().__init__(parent)
+		self.setObjectName("nodeActionPanel")
+		self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+		self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+		layout = QHBoxLayout(self)
+		layout.setContentsMargins(8, 6, 8, 6)
+		layout.setSpacing(6)
+		self.setFixedSize(QSize(self.PANEL_WIDTH, self.PANEL_HEIGHT))
+
+		self._config_button = self._make_button(
+			QStyle.StandardPixmap.SP_FileDialogDetailedView,
+			"编辑节点配置",
+		)
+		self._config_button.clicked.connect(lambda: self.actionTriggered.emit("config", True))
+		layout.addWidget(self._config_button)
+
+		self._pin_button = self._make_button(
+			QStyle.StandardPixmap.SP_TitleBarShadeButton,
+			"固定节点位置",
+			checkable=True,
+		)
+		self._pin_button.toggled.connect(lambda checked: self.actionTriggered.emit("pin", checked))
+		layout.addWidget(self._pin_button)
+
+		self._delete_button = self._make_button(
+			QStyle.StandardPixmap.SP_TrashIcon,
+			"删除节点",
+		)
+		self._delete_button.clicked.connect(lambda: self.actionTriggered.emit("delete", True))
+		layout.addWidget(self._delete_button)
+
+		self.setStyleSheet(
+			"""
+			QWidget#nodeActionPanel {
+				background-color: rgba(40, 40, 40, 220);
+				border-radius: 8px;
+				border: 1px solid rgba(120, 120, 120, 180);
+			}
+			QToolButton {
+				color: rgb(230, 230, 230);
+				padding: 4px;
+				border-radius: 6px;
+			}
+			QToolButton:hover {
+				background-color: rgba(255, 255, 255, 28);
+			}
+			QToolButton:checked {
+				background-color: rgba(88, 124, 196, 160);
+			}
+			"""
+		)
+		for button in (self._config_button, self._pin_button, self._delete_button):
+			button.setFixedSize(QSize(28, 24))
+
+	def _make_button(
+		self,
+		icon_role: QStyle.StandardPixmap,
+		tooltip: str,
+		*,
+		checkable: bool = False,
+	) -> QToolButton:
+		button = QToolButton(self)
+		button.setAutoRaise(True)
+		button.setCheckable(checkable)
+		button.setCursor(Qt.CursorShape.PointingHandCursor)
+		icon = self.style().standardIcon(icon_role)
+		if not icon.isNull():
+			button.setIcon(icon)
+		button.setIconSize(QSize(16, 16))
+		button.setToolTip(tooltip)
+		button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+		return button
+
+	def setPinned(self, pinned: bool) -> None:
+		previous = self._pin_button.blockSignals(True)
+		self._pin_button.setChecked(pinned)
+		self._pin_button.blockSignals(previous)
+		self._pin_button.setToolTip("取消固定节点" if pinned else "固定节点位置")
+
+	@property
+	def isPinned(self) -> bool:
+		return self._pin_button.isChecked()
+
+
 class NodePort(QGraphicsEllipseItem):
 	"""Circular port used for incoming or outgoing connections."""
 
@@ -865,6 +962,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 
 	WIDTH = 200
 	HEIGHT = 100
+	ACTION_PANEL_GAP = 16.0
 
 	def __init__(self, node_model: WorkflowNodeModel) -> None:
 		super().__init__(0, 0, self.WIDTH, self.HEIGHT)
@@ -879,9 +977,15 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.setPen(Qt.PenStyle.NoPen)
 		self.setAcceptHoverEvents(True)
 		self._hovered = False
+		self._pinned = False
+		self._view_scale = 1.0
+		self._action_area_height = self.ACTION_PANEL_GAP + float(NodeActionPanel.PANEL_HEIGHT)
+		self._action_panel: Optional[NodeActionPanel] = None
+		self._action_proxy: Optional[QGraphicsProxyWidget] = None
 		self._base_color = QColor(53, 53, 53)
 		self._accent_color = QColor(90, 90, 90)
 		self._paint_margin = 8.0
+		self._create_action_panel()
 		self.title_item = QGraphicsTextItem(node_model.title, self)
 		title_font = QFont(self.title_item.font())
 		title_font.setPointSizeF(title_font.pointSizeF() + 1.5)
@@ -915,6 +1019,101 @@ class WorkflowNodeItem(QGraphicsRectItem):
 			y_pos = spacing_out * offset - 6
 			port.setPos(self.WIDTH - 1, y_pos)
 
+	def _create_action_panel(self) -> None:
+		if self._action_panel is not None:
+			return
+		panel = NodeActionPanel()
+		panel.setPinned(self._pinned)
+		panel.actionTriggered.connect(self._handle_action_trigger)
+		proxy = QGraphicsProxyWidget(self)
+		proxy.setWidget(panel)
+		proxy.setZValue(5.0)
+		proxy.setOpacity(0.96)
+		proxy.setVisible(False)
+		proxy.setAcceptHoverEvents(True)
+		proxy.setFlag(
+			QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+			True,
+		)
+		self._action_panel = panel
+		self._action_proxy = proxy
+		self._update_action_panel_geometry()
+		self._update_action_panel_visibility()
+
+	def _update_action_panel_geometry(self) -> None:
+		if self._action_proxy is None or self._action_panel is None:
+			return
+		scale = self._view_scale if self._view_scale > 1e-6 else 1.0
+		width_scene = float(NodeActionPanel.PANEL_WIDTH) / scale
+		height_scene = float(NodeActionPanel.PANEL_HEIGHT) / scale
+		gap_scene = self.ACTION_PANEL_GAP / scale
+		x = (self.WIDTH - width_scene) / 2.0
+		y = -gap_scene - height_scene
+		self._action_proxy.setPos(QPointF(x, y))
+		new_action_height = gap_scene + height_scene
+		if not math.isclose(new_action_height, self._action_area_height, rel_tol=1e-4, abs_tol=1e-4):
+			if self.scene() is not None:
+				self.prepareGeometryChange()
+			self._action_area_height = new_action_height
+
+	def _should_show_action_panel(self) -> bool:
+		if self._action_proxy is None:
+			return False
+		if self.isSelected():
+			return True
+		if self._hovered:
+			return True
+		return self._action_proxy.isUnderMouse()
+
+	def _update_action_panel_visibility(self) -> None:
+		if self._action_proxy is None:
+			return
+		self._action_proxy.setVisible(self._should_show_action_panel())
+
+	def _handle_action_trigger(self, action: str, value: bool) -> None:
+		scene_obj = self.scene()
+		if scene_obj is None:
+			return
+		scene = cast(WorkflowScene, scene_obj)
+		if action == "delete":
+			scene._remove_node(self.node_id)
+		elif action == "config":
+			scene.request_config(self.node_id)
+		elif action == "pin":
+			self.set_pinned(value)
+
+	def set_pinned(self, pinned: bool, *, notify: bool = True) -> None:
+		if self._pinned == pinned:
+			return
+		self._pinned = pinned
+		self.setFlag(
+			QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+			not pinned,
+		)
+		if self._action_panel is not None:
+			self._action_panel.setPinned(pinned)
+		scene_obj = self.scene()
+		if notify and scene_obj is not None:
+			scene = cast(WorkflowScene, scene_obj)
+			verb = "已固定" if pinned else "已取消固定"
+			scene.message_posted.emit(f"{verb}节点 {self.node_model.title}")
+			scene.modified.emit()
+		self.update()
+		self._update_action_panel_visibility()
+
+	def on_view_scale_changed(self, scale: float) -> None:
+		if scale <= 0:
+			return
+		if math.isclose(scale, self._view_scale, rel_tol=1e-4):
+			return
+		self._view_scale = scale
+		self._update_action_panel_geometry()
+		self._update_action_panel_visibility()
+
+	@property
+	def is_pinned(self) -> bool:
+		return self._pinned
+
 	def set_title(self, title: str) -> None:
 		self.title_item.setPlainText(title)
 		self.node_model.title = title
@@ -927,6 +1126,8 @@ class WorkflowNodeItem(QGraphicsRectItem):
 				scene.refresh_connections(self)
 				scene.ensure_scene_visible(self)
 				scene.modified.emit()
+		elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+			QTimer.singleShot(0, self._update_action_panel_visibility)
 		return super().itemChange(change, value)
 
 	def get_output_port(self, index: int) -> NodePort:
@@ -957,28 +1158,35 @@ class WorkflowNodeItem(QGraphicsRectItem):
 
 	def hoverEnterEvent(self, event):  # noqa: D401
 		self._hovered = True
+		self._update_action_panel_visibility()
 		self.update()
 		super().hoverEnterEvent(event)
 
 	def hoverLeaveEvent(self, event):  # noqa: D401
 		self._hovered = False
+		self._update_action_panel_visibility()
 		self.update()
 		super().hoverLeaveEvent(event)
 
 	def boundingRect(self) -> QRectF:  # noqa: D401
 		rect = super().boundingRect()
 		margin = self._paint_margin
-		return rect.adjusted(-margin, -margin, margin, margin)
+		top_margin = self._paint_margin + self._action_area_height
+		return rect.adjusted(-margin, -top_margin, margin, margin)
 
 	def paint(self, painter: QPainter, option, widget=None):  # noqa: D401
 		painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 		inner_rect = self.rect().adjusted(1, 1, -1, -1)
 		body_path = QPainterPath()
 		body_path.addRoundedRect(inner_rect, 18, 18)
-		painter.fillPath(body_path, self._base_color)
+		base_color = self._base_color if not self._pinned else QColor(62, 62, 92)
+		accent_color = self._accent_color if not self._pinned else QColor(118, 118, 172)
+		painter.fillPath(body_path, base_color)
 		border_color = QColor(90, 90, 90)
+		if self._pinned:
+			border_color = QColor(132, 154, 214)
 		if self._hovered:
-			border_color = QColor(140, 140, 140)
+			border_color = QColor(140, 140, 140) if not self._pinned else QColor(164, 186, 238)
 		if self.isSelected():
 			border_color = QColor(210, 210, 210)
 		border_pen = QPen(border_color, 2.2)
@@ -994,10 +1202,12 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		header_clip = clip_path.intersected(header_path)
 		painter.save()
 		painter.setClipPath(header_clip)
-		painter.fillPath(header_path, self._accent_color)
+		painter.fillPath(header_path, accent_color)
 		painter.restore()
 
 		glow_color = QColor(140, 140, 140, 90)
+		if self._pinned:
+			glow_color = QColor(160, 190, 240, 110)
 		if self.isSelected():
 			glow_color = QColor(210, 210, 210, 130)
 		if self._hovered or self.isSelected():
@@ -1031,6 +1241,7 @@ class WorkflowScene(QGraphicsScene):
 		self._scene_threshold = 220.0
 		self._scene_growth_step = 800.0
 		self._default_scene_rect = QRectF(-8000.0, -6000.0, 16000.0, 12000.0)
+		self._view_scale = 1.0
 		self.setSceneRect(self._default_scene_rect)
 
 	def drawBackground(self, painter: QPainter, rect: QRectF | QRect) -> None:  # noqa: D401
@@ -1186,6 +1397,7 @@ class WorkflowScene(QGraphicsScene):
 		item.setPos(pos - QPointF(item.WIDTH / 2, item.HEIGHT / 2))
 		self.addItem(item)
 		self.node_items[node_id] = item
+		item.on_view_scale_changed(self._view_scale)
 		self._promote_node(item)
 		summary = self._format_node_summary(node_model.config)
 		item.setToolTip(summary)
@@ -1526,6 +1738,7 @@ class WorkflowScene(QGraphicsScene):
 					"title": node_model.title,
 					"config": dict(node_model.config),
 					"position": {"x": float(pos.x()), "y": float(pos.y())},
+					"pinned": item.is_pinned,
 				}
 			)
 		edges: List[Dict[str, Any]] = []
@@ -1573,7 +1786,18 @@ class WorkflowScene(QGraphicsScene):
 			item.setPos(QPointF(x_val, y_val))
 			self.addItem(item)
 			self.node_items[node_id] = item
+			item.on_view_scale_changed(self._view_scale)
 			self._promote_node(item)
+			pinned_value = entry.get("pinned", False)
+			pinned = False
+			if isinstance(pinned_value, bool):
+				pinned = pinned_value
+			elif isinstance(pinned_value, str):
+				pinned = pinned_value.strip().lower() in {"1", "true", "yes", "on"}
+			else:
+				pinned = bool(pinned_value)
+			if pinned:
+				item.set_pinned(True, notify=False)
 			summary = self._format_node_summary(node_model.config)
 			item.setToolTip(summary)
 		for entry in edges_data:
@@ -1641,6 +1865,15 @@ class WorkflowScene(QGraphicsScene):
 		self._recalculate_scene_rect()
 		if mark_modified:
 			self.modified.emit()
+
+	def set_view_scale(self, scale: float) -> None:
+		if scale <= 0:
+			scale = 1.0
+		if math.isclose(scale, self._view_scale, rel_tol=1e-4):
+			return
+		self._view_scale = scale
+		for item in self.node_items.values():
+			item.on_view_scale_changed(scale)
 
 
 # -- Configuration dialog --------------------------------------------------
@@ -2501,7 +2734,9 @@ class WorkflowInterface(QWidget):
 		self.view.setObjectName("workflowView")
 		self.view.setFrameShape(QFrame.Shape.NoFrame)
 		self.view.setStyleSheet("QGraphicsView#workflowView { background: transparent; border: none; }")
+		self.view.zoomChanged.connect(self.scene.set_view_scale)
 		self.view.zoomChanged.connect(lambda value: self.show_status(f"缩放 {value * 100:.0f}%"))
+		self.scene.set_view_scale(self.view.transform().m11())
 
 		self.log_widget = QTextEdit(self)
 		self.log_widget.setReadOnly(True)
