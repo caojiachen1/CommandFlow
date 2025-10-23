@@ -93,6 +93,7 @@ from PySide6.QtWidgets import (
 	QFrame,
 	QTabWidget,
 	QStyle,
+	QSizeGrip,
 )
 
 try:
@@ -960,8 +961,11 @@ class ConnectionItem(QGraphicsPathItem):
 class WorkflowNodeItem(QGraphicsRectItem):
 	"""Rectangular node wrapper that mirrors a ``WorkflowNodeModel``."""
 
-	WIDTH = 200
-	HEIGHT = 100
+	WIDTH = 200  # default width
+	HEIGHT = 100  # default height
+	MIN_WIDTH = 140
+	MIN_HEIGHT = 80
+	HANDLE_SIZE = 16  # px in item coordinates
 	ACTION_PANEL_GAP = 16.0
 
 	def __init__(self, node_model: WorkflowNodeModel) -> None:
@@ -977,6 +981,14 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		self.setPen(Qt.PenStyle.NoPen)
 		self.setAcceptHoverEvents(True)
 		self._hovered = False
+		# runtime geometry
+		self._width: float = float(self.WIDTH)
+		self._height: float = float(self.HEIGHT)
+		self.setRect(0.0, 0.0, self._width, self._height)
+		# resize interaction
+		self._resizing: bool = False
+		self._resize_start_scene: QPointF | None = None
+		self._resize_initial_size: QSizeF | None = None
 		self._pinned = False
 		self._view_scale = 1.0
 		self._action_area_height = self.ACTION_PANEL_GAP + float(NodeActionPanel.PANEL_HEIGHT)
@@ -1007,17 +1019,17 @@ class WorkflowNodeItem(QGraphicsRectItem):
 
 	def update_ports(self) -> None:
 		if self.input_ports:
-			spacing_in = self.HEIGHT / (len(self.input_ports) + 1)
+			spacing_in = self._height / (len(self.input_ports) + 1)
 			for offset, port in enumerate(self.input_ports, start=1):
 				y_pos = spacing_in * offset - 6
 				port.setPos(1, y_pos)
 		count_out = len(self.output_ports)
 		if count_out == 0:
 			return
-		spacing_out = self.HEIGHT / (count_out + 1)
+		spacing_out = self._height / (count_out + 1)
 		for offset, port in enumerate(self.output_ports, start=1):
 			y_pos = spacing_out * offset - 6
-			port.setPos(self.WIDTH - 1, y_pos)
+			port.setPos(self._width - 1, y_pos)
 
 	def _create_action_panel(self) -> None:
 		if self._action_panel is not None:
@@ -1047,7 +1059,7 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		width_scene = float(NodeActionPanel.PANEL_WIDTH) / scale
 		height_scene = float(NodeActionPanel.PANEL_HEIGHT) / scale
 		gap_scene = self.ACTION_PANEL_GAP / scale
-		x = (self.WIDTH - width_scene) / 2.0
+		x = (self._width - width_scene) / 2.0
 		y = -gap_scene - height_scene
 		self._action_proxy.setPos(QPointF(x, y))
 		new_action_height = gap_scene + height_scene
@@ -1145,12 +1157,102 @@ class WorkflowNodeItem(QGraphicsRectItem):
 		scene.request_config(self.node_id)
 		super().mouseDoubleClickEvent(event)
 
+	def _in_resize_handle(self, pos: QPointF) -> bool:
+		# Local pos in item coordinates
+		rect = self.rect()
+		return (
+			pos.x() >= rect.right() - self.HANDLE_SIZE and
+			pos.y() >= rect.bottom() - self.HANDLE_SIZE and
+			pos.x() <= rect.right() + 0.5 and
+			pos.y() <= rect.bottom() + 0.5
+		)
+
+	def _begin_resize(self, scene_pos: QPointF) -> None:
+		self._resizing = True
+		self._resize_start_scene = scene_pos
+		self._resize_initial_size = QSizeF(self._width, self._height)
+		self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+
+	def _apply_resize_delta(self, scene_pos: QPointF) -> None:
+		if not self._resizing or self._resize_start_scene is None or self._resize_initial_size is None:
+			return
+		# Map delta in scene coordinates to item coordinates (they are the same scale when no rotation)
+		delta = scene_pos - self._resize_start_scene
+		new_w = max(self.MIN_WIDTH, float(self._resize_initial_size.width() + delta.x()))
+		new_h = max(self.MIN_HEIGHT, float(self._resize_initial_size.height() + delta.y()))
+		if math.isclose(new_w, self._width, rel_tol=1e-4) and math.isclose(new_h, self._height, rel_tol=1e-4):
+			return
+		self._width = new_w
+		self._height = new_h
+		self.prepareGeometryChange()
+		self.setRect(0.0, 0.0, self._width, self._height)
+		self.update_ports()
+		self._update_action_panel_geometry()
+		scene_obj = self.scene()
+		if scene_obj is not None:
+			scene = cast(WorkflowScene, scene_obj)
+			scene.refresh_connections(self)
+			scene.modified.emit()
+		self.update()
+
+	def _end_resize(self) -> None:
+		if not self._resizing:
+			return
+		self._resizing = False
+		self._resize_start_scene = None
+		self._resize_initial_size = None
+		self.setCursor(Qt.CursorShape.ArrowCursor)
+
+	def set_size(self, width: float, height: float) -> None:
+		"""Programmatically set node size with clamping and updates."""
+		w = max(self.MIN_WIDTH, float(width))
+		h = max(self.MIN_HEIGHT, float(height))
+		if math.isclose(w, self._width, rel_tol=1e-4) and math.isclose(h, self._height, rel_tol=1e-4):
+			return
+		self._width = w
+		self._height = h
+		self.prepareGeometryChange()
+		self.setRect(0.0, 0.0, self._width, self._height)
+		self.update_ports()
+		self._update_action_panel_geometry()
+		scene_obj = self.scene()
+		if scene_obj is not None:
+			scene = cast(WorkflowScene, scene_obj)
+			scene.refresh_connections(self)
+			scene.modified.emit()
+		self.update()
+
 	def mousePressEvent(self, event):  # noqa: D401
+		local_pos = event.pos()
+		if event.button() == Qt.MouseButton.LeftButton and self._in_resize_handle(local_pos):
+			self._begin_resize(event.scenePos())
+			event.accept()
+			return
 		scene = self.scene()
 		if scene is not None:
 			scene_obj = cast(WorkflowScene, scene)
 			scene_obj._promote_node(self)
 		super().mousePressEvent(event)
+
+	def mouseMoveEvent(self, event):  # noqa: D401
+		if self._resizing:
+			self._apply_resize_delta(event.scenePos())
+			event.accept()
+			return
+		# Update cursor when hovering near handle during move
+		local_pos = event.pos()
+		if self._in_resize_handle(local_pos):
+			self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+		else:
+			self.setCursor(Qt.CursorShape.ArrowCursor)
+		super().mouseMoveEvent(event)
+
+	def mouseReleaseEvent(self, event):  # noqa: D401
+		if self._resizing and event.button() == Qt.MouseButton.LeftButton:
+			self._end_resize()
+			event.accept()
+			return
+		super().mouseReleaseEvent(event)
 
 	def hoverEnterEvent(self, event):  # noqa: D401
 		self._hovered = True
@@ -1160,9 +1262,19 @@ class WorkflowNodeItem(QGraphicsRectItem):
 
 	def hoverLeaveEvent(self, event):  # noqa: D401
 		self._hovered = False
+		# Reset cursor when leaving
+		self.setCursor(Qt.CursorShape.ArrowCursor)
 		self._update_action_panel_visibility()
 		self.update()
 		super().hoverLeaveEvent(event)
+
+	def hoverMoveEvent(self, event):  # noqa: D401
+		# Show resize cursor when hovering handle
+		if self._in_resize_handle(event.pos()):
+			self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+		else:
+			self.setCursor(Qt.CursorShape.ArrowCursor)
+		super().hoverMoveEvent(event)
 
 	def boundingRect(self) -> QRectF:  # noqa: D401
 		rect = super().boundingRect()
@@ -1212,6 +1324,13 @@ class WorkflowNodeItem(QGraphicsRectItem):
 			painter.setPen(glow_pen)
 			painter.drawPath(body_path)
 		painter.setPen(Qt.PenStyle.NoPen)
+
+		# draw resize handle indicator (bottom-right corner)
+		handle_rect = QRectF(self._width - self.HANDLE_SIZE, self._height - self.HANDLE_SIZE, self.HANDLE_SIZE - 1.0, self.HANDLE_SIZE - 1.0)
+		painter.fillRect(handle_rect, QColor(255, 255, 255, 36))
+		painter.setPen(QPen(QColor(220, 220, 220, 90), 1))
+		painter.drawLine(handle_rect.bottomLeft() + QPointF(4, -2), handle_rect.topRight() - QPointF(2, -4))
+		painter.drawLine(handle_rect.bottomLeft() + QPointF(2, -0), handle_rect.topRight() - QPointF(0, -2))
 
 
 # -- Workflow scene --------------------------------------------------------
@@ -1390,7 +1509,9 @@ class WorkflowScene(QGraphicsScene):
 			self.message_posted.emit(f"无法创建节点: {exc}")
 			return
 		item = WorkflowNodeItem(node_model)
-		item.setPos(pos - QPointF(item.WIDTH / 2, item.HEIGHT / 2))
+		# center on drop position based on current size
+		rect = item.rect()
+		item.setPos(pos - QPointF(rect.width() / 2.0, rect.height() / 2.0))
 		self.addItem(item)
 		self.node_items[node_id] = item
 		item.on_view_scale_changed(self._view_scale)
@@ -1727,6 +1848,7 @@ class WorkflowScene(QGraphicsScene):
 			if item is None:
 				continue
 			pos = item.pos()
+			rect = item.rect()
 			nodes.append(
 				{
 					"id": node_id,
@@ -1735,6 +1857,7 @@ class WorkflowScene(QGraphicsScene):
 					"config": dict(node_model.config),
 					"position": {"x": float(pos.x()), "y": float(pos.y())},
 					"pinned": item.is_pinned,
+					"size": {"w": float(rect.width()), "h": float(rect.height())},
 				}
 			)
 		edges: List[Dict[str, Any]] = []
@@ -1779,6 +1902,15 @@ class WorkflowScene(QGraphicsScene):
 			position = entry.get("position", {})
 			x_val = float(position.get("x", 0.0)) if isinstance(position, dict) else 0.0
 			y_val = float(position.get("y", 0.0)) if isinstance(position, dict) else 0.0
+			# apply size if provided
+			size_val = entry.get("size", {})
+			try:
+				w_val = float(size_val.get("w", item.rect().width())) if isinstance(size_val, dict) else item.rect().width()
+				h_val = float(size_val.get("h", item.rect().height())) if isinstance(size_val, dict) else item.rect().height()
+			except Exception:
+				w_val = item.rect().width()
+				h_val = item.rect().height()
+			item.set_size(w_val, h_val)
 			item.setPos(QPointF(x_val, y_val))
 			self.addItem(item)
 			self.node_items[node_id] = item
@@ -2490,7 +2622,7 @@ class QuickControlWindow(QWidget):
 		self.setWindowFlag(Qt.WindowType.Tool)
 		self.setWindowModality(Qt.WindowModality.NonModal)
 		self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
-		self.setFixedWidth(260)
+		self.setMinimumWidth(260)
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(16, 16, 16, 16)
 		layout.setSpacing(10)
@@ -2513,6 +2645,17 @@ class QuickControlWindow(QWidget):
 		layout.addWidget(self.stop_button)
 		self._status_label.setMinimumWidth(200)
 		self._update_style()
+
+		# add bottom-right size grip
+		grip_container = QWidget(self)
+		grip_container.setObjectName("quickPanelGripContainer")
+		grip_layout = QHBoxLayout(grip_container)
+		grip_layout.setContentsMargins(0, 0, 0, 0)
+		grip_layout.addStretch(1)
+		grip = QSizeGrip(grip_container)
+		grip.setFixedSize(16, 16)
+		grip_layout.addWidget(grip, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+		layout.addWidget(grip_container, 0)
 
 	def closeEvent(self, event) -> None:  # noqa: D401
 		event.ignore()
