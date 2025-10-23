@@ -93,7 +93,6 @@ from PySide6.QtWidgets import (
 	QFrame,
 	QTabWidget,
 	QStyle,
-	QSizeGrip,
 )
 
 try:
@@ -1324,13 +1323,6 @@ class WorkflowNodeItem(QGraphicsRectItem):
 			painter.setPen(glow_pen)
 			painter.drawPath(body_path)
 		painter.setPen(Qt.PenStyle.NoPen)
-
-		# draw resize handle indicator (bottom-right corner)
-		handle_rect = QRectF(self._width - self.HANDLE_SIZE, self._height - self.HANDLE_SIZE, self.HANDLE_SIZE - 1.0, self.HANDLE_SIZE - 1.0)
-		painter.fillRect(handle_rect, QColor(255, 255, 255, 36))
-		painter.setPen(QPen(QColor(220, 220, 220, 90), 1))
-		painter.drawLine(handle_rect.bottomLeft() + QPointF(4, -2), handle_rect.topRight() - QPointF(2, -4))
-		painter.drawLine(handle_rect.bottomLeft() + QPointF(2, -0), handle_rect.topRight() - QPointF(0, -2))
 
 
 # -- Workflow scene --------------------------------------------------------
@@ -2646,16 +2638,7 @@ class QuickControlWindow(QWidget):
 		self._status_label.setMinimumWidth(200)
 		self._update_style()
 
-		# add bottom-right size grip
-		grip_container = QWidget(self)
-		grip_container.setObjectName("quickPanelGripContainer")
-		grip_layout = QHBoxLayout(grip_container)
-		grip_layout.setContentsMargins(0, 0, 0, 0)
-		grip_layout.addStretch(1)
-		grip = QSizeGrip(grip_container)
-		grip.setFixedSize(16, 16)
-		grip_layout.addWidget(grip, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
-		layout.addWidget(grip_container, 0)
+		# 保持窗口可通过系统边框调整大小，不添加可见的尺寸把手
 
 	def closeEvent(self, event) -> None:  # noqa: D401
 		event.ignore()
