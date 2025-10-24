@@ -2356,7 +2356,11 @@ class ConfigDialog(ConfigDialogBase):
 				label_widget = SubtitleLabel(label_text, form_container)
 			else:
 				label_widget = QLabel(label_text, form_container)
-			form_layout.addRow(label_widget, widget)
+			if field.get("key") == "code" and field.get("type") == "multiline":
+				form_layout.addRow(label_widget)
+				form_layout.addRow(widget)
+			else:
+				form_layout.addRow(label_widget, widget)
 			self.widgets[field["key"]] = widget
 
 		if HAVE_FLUENT_WIDGETS:
@@ -2365,7 +2369,11 @@ class ConfigDialog(ConfigDialogBase):
 			fluent_self.viewLayout.addWidget(self.titleLabel)
 			fluent_self.viewLayout.addWidget(form_container)
 			if hasattr(fluent_self, "widget"):
-				fluent_self.widget.setMinimumWidth(420)
+				base_widget = fluent_self.widget
+				base_widget.setMinimumWidth(420)
+				if getattr(node_model, "type_name", "") == "python_code":
+					base_widget.setMinimumWidth(620)
+					base_widget.setMinimumHeight(480)
 			if hasattr(fluent_self, "yesButton"):
 				fluent_self.yesButton.setText("保存")
 			if hasattr(fluent_self, "cancelButton"):
@@ -2381,6 +2389,9 @@ class ConfigDialog(ConfigDialogBase):
 			buttons.accepted.connect(self.accept)
 			buttons.rejected.connect(self.reject)
 			layout.addWidget(buttons)
+			if getattr(node_model, "type_name", "") == "python_code":
+				self.resize(640, 520)
+				self.setMinimumSize(620, 480)
 
 	def _create_widget(self, field: Dict[str, Any], values: Dict[str, Any]) -> QWidget:
 		key = cast(str, field["key"])
@@ -2455,7 +2466,12 @@ class ConfigDialog(ConfigDialogBase):
 			widget_cls = FluentTextEdit if HAVE_FLUENT_WIDGETS else QTextEdit
 			widget = widget_cls(self)
 			widget.setPlainText(str(value or ""))
-			widget.setMinimumHeight(80)
+			widget.setMinimumHeight(200 if field.get("key") == "code" else 80)
+			try:
+				widget.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+			except AttributeError:
+				pass
+			widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 			return widget
 		widget_cls = FluentLineEdit if HAVE_FLUENT_WIDGETS else QLineEdit
 		widget = widget_cls(self)

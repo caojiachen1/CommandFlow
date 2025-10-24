@@ -287,20 +287,28 @@ class ScreenshotNode(WorkflowNodeModel):
             "height": 300,
             "output_dir": "captures",
             "filename": "capture_{index:03d}.png",
+            "fullscreen": False,
         }
 
     def validate_config(self) -> None:
         cfg = self.config
-        for key in ("x", "y", "width", "height"):
-            value = cfg.get(key)
-            if not isinstance(value, int) or value < 0:
-                raise ValueError(f"{key} must be a non-negative integer")
-        if cfg["width"] == 0 or cfg["height"] == 0:
-            raise ValueError("width/height must be positive")
+        fullscreen = bool(cfg.get("fullscreen", False))
+        cfg["fullscreen"] = fullscreen
+        if not fullscreen:
+            for key in ("x", "y", "width", "height"):
+                value = cfg.get(key)
+                if not isinstance(value, int) or value < 0:
+                    raise ValueError(f"{key} must be a non-negative integer")
+            if cfg["width"] == 0 or cfg["height"] == 0:
+                raise ValueError("width/height must be positive")
         if not isinstance(cfg.get("output_dir"), str):
             raise ValueError("output_dir must be a string")
-        if not isinstance(cfg.get("filename"), str) or "{" not in cfg["filename"]:
-            raise ValueError("filename must be a format string containing '{index}'")
+        if not isinstance(cfg.get("filename"), str):
+            raise ValueError("filename must be a string")
+        name = cfg.get("filename", "")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("filename must not be empty")
+        cfg["filename"] = name.strip()
 
     def config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -331,16 +339,93 @@ class ScreenshotNode(WorkflowNodeModel):
                 "label": "文件名模式",
                 "type": "str",
             },
+            {
+                "key": "fullscreen",
+                "label": "全屏截图",
+                "type": "bool",
+            },
         ]
 
     def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Path:
         cfg = self.config
         output_dir = Path(cfg["output_dir"]).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        index = len([p for p in output_dir.iterdir() if p.is_file()]) + 1
-        filename = cfg["filename"].format(index=index)
-        region = (cfg["x"], cfg["y"], cfg["width"], cfg["height"])
-        path = runtime.take_screenshot(region)
+        template = str(cfg["filename"])
+        def next_available_with_index(pattern: str) -> str:
+            i = 1
+            while True:
+                try:
+                    candidate = pattern.format(index=i)
+                except Exception:
+                    # 如果占位符不合法，回退为原样
+                    return pattern
+                target = output_dir / candidate
+                if not target.exists():
+                    return candidate
+                i += 1
+
+        def uniquify(name: str) -> str:
+            base = name
+            stem = base
+            suffix = ""
+            if "." in base:
+                stem = base[: base.rfind(".")]
+                suffix = base[base.rfind("."):]
+            i = 1
+            candidate = base
+            while (output_dir / candidate).exists():
+                candidate = f"{stem} ({i}){suffix}"
+                i += 1
+            return candidate
+
+        if "{index" in template:
+            filename = next_available_with_index(template)
+        else:
+            filename = uniquify(template)
+        fullscreen = bool(cfg.get("fullscreen", False))
+        if fullscreen:
+            # 尝试使用 runtime 的后端直接全屏截图；若不可用，则计算全屏区域
+            path: Path
+            backend = getattr(runtime, "_pyautogui", None)
+            if backend is not None:
+                try:
+                    import tempfile
+                    image = backend.screenshot()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                        image.save(tmp.name)
+                        path = Path(tmp.name)
+                except Exception as _:
+                    # 回退到区域截图
+                    dpi = float(getattr(runtime, "dpi_scale", 1.0) or 1.0)
+                    try:
+                        import ctypes  # type: ignore
+                        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+                        width_px = int(user32.GetSystemMetrics(0))
+                        height_px = int(user32.GetSystemMetrics(1))
+                    except Exception:
+                        width_px = 1920
+                        height_px = 1080
+                    unscaled_w = max(int(round(width_px / dpi)), 1)
+                    unscaled_h = max(int(round(height_px / dpi)), 1)
+                    region = (0, 0, unscaled_w, unscaled_h)
+                    path = runtime.take_screenshot(region)
+            else:
+                dpi = float(getattr(runtime, "dpi_scale", 1.0) or 1.0)
+                try:
+                    import ctypes  # type: ignore
+                    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+                    width_px = int(user32.GetSystemMetrics(0))
+                    height_px = int(user32.GetSystemMetrics(1))
+                except Exception:
+                    width_px = 1920
+                    height_px = 1080
+                unscaled_w = max(int(round(width_px / dpi)), 1)
+                unscaled_h = max(int(round(height_px / dpi)), 1)
+                region = (0, 0, unscaled_w, unscaled_h)
+                path = runtime.take_screenshot(region)
+        else:
+            region = (cfg["x"], cfg["y"], cfg["width"], cfg["height"])
+            path = runtime.take_screenshot(region)
         target_path = output_dir / filename
         shutil.move(str(path), target_path)
         context.record(self.id, str(target_path))
@@ -1893,6 +1978,56 @@ class CommandNode(WorkflowNodeModel):
         return result
 
 
+class PythonCodeNode(WorkflowNodeModel):
+    type_name = "python_code"
+    display_name = "执行Python代码"
+    category = "系统操作"
+
+    def default_config(self) -> Dict[str, Any]:
+        return {
+            "code": "# 在此编写 Python 代码\n# 可通过 context.record('节点ID', 值) 保存结果\nresult = None\n",
+        }
+
+    def validate_config(self) -> None:
+        code = self.config.get("code", "")
+        if not isinstance(code, str):
+            raise ValueError("code 必须是字符串")
+        if not code.strip():
+            raise ValueError("Python 代码不能为空")
+        self.config["code"] = code
+
+    def config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "code",
+                "label": "Python代码",
+                "type": "multiline",
+            }
+        ]
+
+    def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Any:
+        code = self.config.get("code", "")
+        try:
+            compiled = compile(code, "<workflow-python>", "exec")
+        except SyntaxError as exc:  # pragma: no cover - defensive
+            raise ExecutionError(f"Python 代码语法错误: {exc}") from exc
+        # 使用同一个命名空间作为 globals/locals，确保 import 的模块和变量在同一作用域可见
+        execution_globals: Dict[str, Any] = {
+            "__builtins__": __builtins__,
+            "context": context,
+            "runtime": runtime,
+            "results": context.results,
+        }
+        try:
+            exec(compiled, execution_globals, execution_globals)
+        except Exception as exc:  # pragma: no cover - user code failure
+            raise ExecutionError(f"Python 代码执行失败: {exc}") from exc
+
+        result_value = execution_globals.get("result")
+        context.record(self.id, result_value)
+        return result_value
+
+
 class ConditionNodeBase(WorkflowNodeModel):
     """Base class for reusable condition evaluation nodes."""
 
@@ -2237,7 +2372,8 @@ class ForLoopNode(WorkflowNodeModel):
         }
 
     def output_ports(self) -> List[str]:
-        return ["循环结束", "循环入口", "循环出口"]
+        # 仅两个输出：循环结束、循环体（入口）。不再提供“循环出口”标记端口。
+        return ["循环结束", "循环体"]
 
     def validate_config(self) -> None:
         numeric_keys = ("start", "end", "step")
@@ -2341,6 +2477,7 @@ class ForLoopNode(WorkflowNodeModel):
         if isinstance(state, dict):
             should_continue = bool(state.get("should_continue"))
         if should_continue:
+            # 继续下一轮：跳转到“循环体”入口
             return graph.get_outgoing_target(self.id, 1)
         return graph.get_outgoing_target(self.id, 0)
 
@@ -2369,6 +2506,7 @@ NODE_REGISTRY = {
     FileMoveNode.type_name: FileMoveNode,
     FileDeleteNode.type_name: FileDeleteNode,
     CommandNode.type_name: CommandNode,
+    PythonCodeNode.type_name: PythonCodeNode,
     SwitchContextNode.type_name: SwitchContextNode,
     IfConditionNode.type_name: IfConditionNode,
     EqualsConditionNode.type_name: EqualsConditionNode,
@@ -2608,46 +2746,64 @@ class WorkflowGraph:
                             f"{node.title} 的条件输入必须连接条件节点的结果端口"
                         )
             elif isinstance(node, (WhileLoopNode, ForLoopNode)):
-                required_ports = {
-                    1: port_labels[1],
-                    2: port_labels[2],
-                }
-                for idx, label in required_ports.items():
-                    edges_for_port = mapped.get(idx)
-                    if not edges_for_port:
+                if isinstance(node, WhileLoopNode):
+                    # While 仍然要求连接：循环入口(1) 与 循环出口(2)
+                    required_ports = {
+                        1: port_labels[1],
+                        2: port_labels[2],
+                    }
+                    for idx, label in required_ports.items():
+                        edges_for_port = mapped.get(idx)
+                        if not edges_for_port:
+                            raise ExecutionError(
+                                f"{node.title} 的输出端口 '{label}' 未连接"
+                            )
+                        if len(edges_for_port) > 1:
+                            raise ExecutionError(
+                                f"{node.title} 的输出端口 '{label}' 只能连接一个目标"
+                            )
+                        if edges_for_port[0].target_port != 0:
+                            raise ExecutionError(
+                                f"{node.title} 的输出端口 '{label}' 必须连接到执行输入端口"
+                            )
+                else:  # ForLoopNode 新语义：仅要求“循环体”(1) 必须连接
+                    edges_for_body = mapped.get(1, [])
+                    if not edges_for_body:
+                        raise ExecutionError(f"{node.title} 的输出端口 '{port_labels[1]}' 未连接")
+                    if len(edges_for_body) > 1:
                         raise ExecutionError(
-                            f"{node.title} 的输出端口 '{label}' 未连接"
+                            f"{node.title} 的输出端口 '{port_labels[1]}' 只能连接一个目标"
                         )
-                    if len(edges_for_port) > 1:
+                    if edges_for_body[0].target_port != 0:
                         raise ExecutionError(
-                            f"{node.title} 的输出端口 '{label}' 只能连接一个目标"
+                            f"{node.title} 的输出端口 '{port_labels[1]}' 必须连接到执行输入端口"
                         )
-                    if edges_for_port[0].target_port != 0:
-                        raise ExecutionError(
-                            f"{node.title} 的输出端口 '{label}' 必须连接到执行输入端口"
-                        )
-                tail_edge = mapped[2][0]
-                tail_target = tail_edge.target
-                if tail_target == node_id:
-                    raise ExecutionError(
-                        f"{node.title} 的输出端口 '{port_labels[2]}' 不能连接到节点自身"
-                    )
-                previous_loop = loop_tail_sources.get(tail_target)
-                if previous_loop is not None and previous_loop != node_id:
-                    tail_title = (
-                        self.nodes[tail_target].title
-                        if tail_target in self.nodes
-                        else tail_target
-                    )
-                    prev_title = (
-                        self.nodes[previous_loop].title
-                        if previous_loop in self.nodes
-                        else previous_loop
-                    )
-                    raise ExecutionError(
-                        f"节点 {tail_title} 已被循环节点 {prev_title} 用作循环结尾"
-                    )
-                loop_tail_sources[tail_target] = node_id
+                # 仅针对 WhileLoopNode 检查旧式“循环出口”尾节点唯一性
+                if isinstance(node, WhileLoopNode):
+                    tail_edges = mapped.get(2, [])
+                    if tail_edges:
+                        tail_edge = tail_edges[0]
+                        tail_target = tail_edge.target
+                        if tail_target == node_id:
+                            raise ExecutionError(
+                                f"{node.title} 的输出端口 '{port_labels[2]}' 不能连接到节点自身"
+                            )
+                        previous_loop = loop_tail_sources.get(tail_target)
+                        if previous_loop is not None and previous_loop != node_id:
+                            tail_title = (
+                                self.nodes[tail_target].title
+                                if tail_target in self.nodes
+                                else tail_target
+                            )
+                            prev_title = (
+                                self.nodes[previous_loop].title
+                                if previous_loop in self.nodes
+                                else previous_loop
+                            )
+                            raise ExecutionError(
+                                f"节点 {tail_title} 已被循环节点 {prev_title} 用作循环结尾"
+                            )
+                        loop_tail_sources[tail_target] = node_id
             else:
                 control_edges = [edge for edges in mapped.values() for edge in edges if edge.target_port == 0]
                 if len(control_edges) > 1:
@@ -2703,9 +2859,50 @@ class WorkflowGraph:
         for node_id, node in self.nodes.items():
             if not isinstance(node, (WhileLoopNode, ForLoopNode)):
                 continue
-            for edge in self.edges.get(node_id, []):
-                if edge.source_port == 2 and edge.target_port == 0:
-                    mapping[edge.target] = node_id
+            if isinstance(node, WhileLoopNode):
+                # 旧式 While：通过“循环出口”标记最后一步
+                for edge in self.edges.get(node_id, []):
+                    if edge.source_port == 2 and edge.target_port == 0:
+                        mapping[edge.target] = node_id
+                continue
+
+            # ForLoopNode 新语义：没有“循环出口”。
+            # 计算“循环体”子图：从 For 的端口1（循环体）出发，沿着 target_port==0 的边遍历，
+            # 所有可达节点构成循环体。随后把循环体中“没有继续指向循环体内部节点”的节点
+            # 标记为循环尾节点，执行完它们后回跳到 For。
+            body_entry = self.get_outgoing_target(node_id, 1, target_port=0)
+            if body_entry is None:
+                continue
+            # BFS 收集循环体
+            body_nodes: Set[str] = set()
+            queue = [body_entry]
+            while queue:
+                current = queue.pop(0)
+                if current in body_nodes:
+                    continue
+                body_nodes.add(current)
+                for e in self.edges.get(current, []):
+                    if e.target_port != 0:
+                        continue
+                    queue.append(e.target)
+            # 找出“出口节点”：其默认执行边（target_port==0）不存在，或指向非 body 内节点
+            for candidate in list(body_nodes):
+                has_internal_next = False
+                for e in self.edges.get(candidate, []):
+                    if e.target_port != 0:
+                        continue
+                    if e.target in body_nodes:
+                        has_internal_next = True
+                        break
+                if not has_internal_next:
+                    if candidate == node_id:
+                        continue
+                    # 如被多个循环节点标记为尾节点，抛错以避免歧义
+                    if candidate in mapping and mapping[candidate] != node_id:
+                        raise ExecutionError(
+                            f"节点 {self.nodes[candidate].title} 同时被多个循环节点用作循环结尾"
+                        )
+                    mapping[candidate] = node_id
         return mapping
 
     def get_outgoing_target(
