@@ -288,6 +288,7 @@ class ScreenshotNode(WorkflowNodeModel):
             "output_dir": "captures",
             "filename": "capture_{index:03d}.png",
             "fullscreen": False,
+            "overwrite": False,
         }
 
     def validate_config(self) -> None:
@@ -344,6 +345,11 @@ class ScreenshotNode(WorkflowNodeModel):
                 "label": "全屏截图",
                 "type": "bool",
             },
+            {
+                "key": "overwrite",
+                "label": "覆盖已存在文件",
+                "type": "bool",
+            },
         ]
 
     def execute(self, context: ExecutionContext, runtime: AutomationRuntime) -> Path:
@@ -351,6 +357,8 @@ class ScreenshotNode(WorkflowNodeModel):
         output_dir = Path(cfg["output_dir"]).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         template = str(cfg["filename"])
+        overwrite = bool(cfg.get("overwrite", False))
+        
         def next_available_with_index(pattern: str) -> str:
             i = 1
             while True:
@@ -378,10 +386,23 @@ class ScreenshotNode(WorkflowNodeModel):
                 i += 1
             return candidate
 
-        if "{index" in template:
-            filename = next_available_with_index(template)
+        # 根据覆盖选项决定文件名处理方式
+        if overwrite:
+            # 覆盖模式：直接使用模板文件名（如果有 {index}，使用 index=1）
+            if "{index" in template:
+                try:
+                    filename = template.format(index=1)
+                except Exception:
+                    filename = template
+            else:
+                filename = template
         else:
-            filename = uniquify(template)
+            # 非覆盖模式：查找可用文件名
+            if "{index" in template:
+                filename = next_available_with_index(template)
+            else:
+                filename = uniquify(template)
+        
         fullscreen = bool(cfg.get("fullscreen", False))
         if fullscreen:
             # 尝试使用 runtime 的后端直接全屏截图；若不可用，则计算全屏区域
