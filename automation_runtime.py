@@ -21,29 +21,28 @@ def get_system_dpi_scale() -> float:
 
     if sys.platform != "win32":
         return 1.0
+    
+    # Method 1: Try GetScaleFactorForDevice (Windows 8.1+)
     try:
+        shcore = ctypes.windll.shcore
         scale_value = ctypes.c_uint(0)
-        shcore = getattr(ctypes, "windll", None)
-        if shcore is not None:
-            shcore = getattr(shcore, "shcore", None)
-        if shcore is not None:
-            get_scale_factor = getattr(shcore, "GetScaleFactorForDevice", None)
-            if get_scale_factor is not None:
-                if get_scale_factor(0, ctypes.byref(scale_value)) == 0 and scale_value.value:
-                    return max(scale_value.value / 100.0, 0.1)
-    except Exception:
+        # DEVICE_PRIMARY = 0
+        if shcore.GetScaleFactorForDevice(0, ctypes.byref(scale_value)) == 0:
+            if scale_value.value > 0:
+                return max(scale_value.value / 100.0, 0.1)
+    except (AttributeError, OSError):
         pass
 
+    # Method 2: Try GetDpiForSystem (Windows 10 1607+)
     try:
         user32 = ctypes.windll.user32
-        get_dpi_for_system = getattr(user32, "GetDpiForSystem", None)
-        if get_dpi_for_system is not None:
-            dpi = get_dpi_for_system()
-            if dpi:
-                return max(dpi / 96.0, 0.1)
-    except Exception:
+        dpi = user32.GetDpiForSystem()
+        if dpi > 0:
+            return max(dpi / 96.0, 0.1)
+    except (AttributeError, OSError):
         pass
 
+    # Method 3: Try GetDeviceCaps with screen DC (Windows 7+)
     try:
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
@@ -52,9 +51,20 @@ def get_system_dpi_scale() -> float:
             LOGPIXELSX = 88
             dpi_x = gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
             user32.ReleaseDC(0, hdc)
-            if dpi_x:
+            if dpi_x > 0:
                 return max(dpi_x / 96.0, 0.1)
-    except Exception:
+    except (AttributeError, OSError):
+        pass
+
+    # Method 4: Try GetDpiForWindow with desktop window (fallback)
+    try:
+        user32 = ctypes.windll.user32
+        desktop_hwnd = user32.GetDesktopWindow()
+        if desktop_hwnd:
+            dpi = user32.GetDpiForWindow(desktop_hwnd)
+            if dpi > 0:
+                return max(dpi / 96.0, 0.1)
+    except (AttributeError, OSError):
         pass
 
     return 1.0
@@ -76,7 +86,8 @@ class PyAutoGuiRuntime:
             "FailSafeException",
             RuntimeError,
         )
-        self._dpi_scale = dpi_scale if dpi_scale and dpi_scale > 0 else get_system_dpi_scale()
+        # 禁用 DPI 缩放：始终使用 1.0，输入坐标直接对应物理像素
+        self._dpi_scale = 1.0
 
     @staticmethod
     def _import_pyautogui() -> Any:

@@ -11,6 +11,38 @@ from __future__ import annotations
 
 import sys
 
+# CRITICAL: Configure DPI awareness BEFORE any GUI imports
+# This must happen before QApplication or any Qt imports
+if sys.platform == "win32":
+	try:
+		import ctypes
+		dpi_awareness_set = False
+		# Try Per-Monitor V2 (Windows 10 1703+) - best option
+		try:
+			result = ctypes.windll.shcore.SetProcessDpiAwareness(2)
+			if result == 0:
+				dpi_awareness_set = True
+				print("[DPI] Set Per-Monitor DPI Awareness V2")
+		except (OSError, AttributeError) as e:
+			# Try SetProcessDpiAwarenessContext (Windows 10 1607+)
+			try:
+				result = ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+				dpi_awareness_set = True
+				print("[DPI] Set DPI Awareness Context (Per-Monitor V2)")
+			except (OSError, AttributeError):
+				# Fallback to System DPI Aware (Windows Vista+)
+				try:
+					result = ctypes.windll.user32.SetProcessDPIAware()
+					dpi_awareness_set = True
+					print("[DPI] Set System DPI Aware")
+				except (OSError, AttributeError):
+					pass
+		
+		if not dpi_awareness_set:
+			print("[DPI] Warning: Failed to set DPI awareness")
+	except ImportError:
+		pass
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication
@@ -34,14 +66,17 @@ except ImportError:  # pragma: no cover - optional dependency
 	def setThemeColor(*_args, **_kwargs):  # type: ignore[func-name-matches]
 		return None
 
-from ui import configure_windows_dpi, MainWindow
+from ui import MainWindow
 
 
 # -- Application entry point ----------------------------------------------
 
 
 def main() -> None:
-	configure_windows_dpi()
+	# Print coordinate mode information
+	print("[坐标模式] 物理像素模式 - 输入坐标直接对应屏幕物理像素")
+	print("[坐标模式] DPI 缩放已禁用 - 输入 100 将点击物理像素 100")
+	
 	app = QApplication(sys.argv)
 	if HAVE_FLUENT_WIDGETS:
 		app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)

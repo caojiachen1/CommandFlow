@@ -199,17 +199,41 @@ def configure_windows_dpi() -> None:
 
 	if sys.platform != "win32":
 		return
+	
+	# Try Per-Monitor V2 awareness first (Windows 10 1703+)
 	try:
 		import ctypes
-
+		# PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
 		ctypes.windll.shcore.SetProcessDpiAwareness(2)
-	except Exception:
-		try:
-			import ctypes
+		return
+	except (OSError, AttributeError):
+		pass
+	
+	# Try Per-Monitor V1 awareness (Windows 8.1+)
+	try:
+		import ctypes
+		# PROCESS_PER_MONITOR_DPI_AWARE = 2
+		ctypes.windll.shcore.SetProcessDpiAwareness(2)
+		return
+	except (OSError, AttributeError):
+		pass
 
-			ctypes.windll.user32.SetProcessDpiAware()
-		except Exception:
-			pass
+	# Try System DPI awareness (Windows Vista+)
+	try:
+		import ctypes
+		ctypes.windll.user32.SetProcessDPIAware()
+		return
+	except (OSError, AttributeError):
+		pass
+	
+	# Last resort: Try SetProcessDpiAwarenessContext (Windows 10 1607+)
+	try:
+		import ctypes
+		# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+		ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+		return
+	except (OSError, AttributeError):
+		pass
 
 
 def _show_message(parent: QWidget, title: str, message: str, kind: str) -> None:
@@ -2872,7 +2896,6 @@ class WorkflowInterface(QWidget):
 		self.view.setObjectName("workflowView")
 		self.view.setFrameShape(QFrame.Shape.NoFrame)
 		self.view.setStyleSheet("QGraphicsView#workflowView { background: transparent; border: none; }")
-		self.view.zoomChanged.connect(self.scene.set_view_scale)
 		self.view.zoomChanged.connect(lambda value: self.show_status(f"缩放 {value * 100:.0f}%"))
 		self.scene.set_view_scale(self.view.transform().m11())
 
@@ -2993,14 +3016,13 @@ class WorkflowInterface(QWidget):
 		self.status_bar.setSizeGripEnabled(False)
 		self.status_bar.setObjectName("workflowStatusBar")
 		layout.addWidget(self.status_bar)
-		self._dpi_scale = get_system_dpi_scale()
-		self.show_status(f"就绪 (DPI缩放 {self._dpi_scale:.2f}x)")
+		self.show_status("就绪 (坐标模式: 物理像素，无 DPI 缩放)")
 		self.setObjectName("workflowInterfaceRoot")
 		self._apply_styles()
 
 		self.runner = WorkflowRunner(
 			graph_supplier=lambda: self.scene.graph.copy(),
-			runtime_factory=lambda: PyAutoGuiRuntime(dpi_scale=self._dpi_scale),
+			runtime_factory=lambda: PyAutoGuiRuntime(dpi_scale=1.0),  # 禁用 DPI 缩放
 			parent=self,
 		)
 		self.runner.started.connect(self._on_runner_started)
