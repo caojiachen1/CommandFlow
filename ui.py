@@ -2056,9 +2056,13 @@ class PathPicker(QWidget):
 		if placeholder:
 			self._line_edit.setPlaceholderText(placeholder)
 		self._line_edit.setText(initial or "")
+		# 设置输入框最小高度
+		self._line_edit.setMinimumHeight(32)
 		layout.addWidget(self._line_edit, 1)
 		self._button = QPushButton("浏览...", self)
 		self._button.setCursor(Qt.CursorShape.PointingHandCursor)
+		# 设置按钮最小高度与输入框一致
+		self._button.setMinimumHeight(32)
 		if mode == "any":
 			menu = QMenu(self)
 			file_action = menu.addAction("选择文件")
@@ -2372,6 +2376,16 @@ class ConfigDialog(ConfigDialogBase):
 		form_container = QWidget(self)
 		form_layout = QFormLayout(form_container)
 		form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+		form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+		form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+		form_layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+		form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+		form_layout.setVerticalSpacing(12)
+		form_layout.setHorizontalSpacing(10)
+		
+		# Store references to widgets that should be hidden when fullscreen is checked
+		self._coordinate_widgets: Dict[str, Tuple[QWidget, QWidget]] = {}
+		
 		for field in node_model.config_schema():
 			widget = self._create_widget(field, node_model.config)
 			label_text = field.get("label", field["key"])
@@ -2380,12 +2394,43 @@ class ConfigDialog(ConfigDialogBase):
 				label_widget = SubtitleLabel(label_text, form_container)
 			else:
 				label_widget = QLabel(label_text, form_container)
-			if field.get("key") == "code" and field.get("type") == "multiline":
+			
+			field_widget = widget  # Store the actual field widget for visibility control
+			
+			# For boolean fields, create a container to align checkbox with label
+			if field.get("type") == "bool":
+				checkbox_container = QWidget(form_container)
+				checkbox_layout = QHBoxLayout(checkbox_container)
+				checkbox_layout.setContentsMargins(0, 0, 0, 0)
+				checkbox_layout.setSpacing(0)
+				checkbox_layout.addWidget(widget)
+				checkbox_layout.addStretch()
+				
+				form_layout.addRow(label_widget, checkbox_container)
+				
+				# If this is the fullscreen checkbox, connect it to show/hide coordinate fields
+				if field.get("key") == "fullscreen" and getattr(node_model, "type_name", "") == "screenshot":
+					if isinstance(widget, QCheckBox):
+						widget.stateChanged.connect(lambda state, w=widget: self._toggle_coordinate_fields(w.isChecked()))
+			elif field.get("key") == "code" and field.get("type") == "multiline":
 				form_layout.addRow(label_widget)
 				form_layout.addRow(widget)
 			else:
 				form_layout.addRow(label_widget, widget)
+			
 			self.widgets[field["key"]] = widget
+			
+			# Track coordinate-related fields for screenshot node
+			if getattr(node_model, "type_name", "") == "screenshot" and field.get("key") in ["x", "y", "width", "height"]:
+				self._coordinate_widgets[field["key"]] = (label_widget, field_widget)
+		
+		# Initial state: hide coordinate fields if fullscreen is already checked
+		if getattr(node_model, "type_name", "") == "screenshot" and "fullscreen" in self.widgets:
+			fullscreen_widget = self.widgets["fullscreen"]
+			if isinstance(fullscreen_widget, QCheckBox):
+				is_fullscreen = fullscreen_widget.isChecked()
+				if is_fullscreen:
+					self._toggle_coordinate_fields(True)
 
 		if HAVE_FLUENT_WIDGETS:
 			self.titleLabel = SubtitleLabel(f"配置 {node_model.title}", self)
@@ -2416,6 +2461,18 @@ class ConfigDialog(ConfigDialogBase):
 			if getattr(node_model, "type_name", "") == "python_code":
 				self.resize(640, 520)
 				self.setMinimumSize(620, 480)
+
+	def _toggle_coordinate_fields(self, hide: bool) -> None:
+		"""Show or hide coordinate fields based on fullscreen checkbox state."""
+		for key in ["x", "y", "width", "height"]:
+			if key in self._coordinate_widgets:
+				label_widget, field_widget = self._coordinate_widgets[key]
+				if hide:
+					label_widget.hide()
+					field_widget.hide()
+				else:
+					label_widget.show()
+					field_widget.show()
 
 	def _create_widget(self, field: Dict[str, Any], values: Dict[str, Any]) -> QWidget:
 		key = cast(str, field["key"])
